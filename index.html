@@ -9557,6 +9557,14 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
 /* ----------------------------------------------------------------------
    POLA PER DPJP
 ---------------------------------------------------------------------- */
+// Kode INA-CBG yang disebut di temuan tapi SUDAH TIDAK dipakai klaim (kode sudah diganti)
+function kodeLamaDiTemuan(claim, it) {
+  const kini = String(claim.inacbgCode || "").trim().toUpperCase();
+  if (!kini) return [];
+  const disebut = [...new Set(`${it.isiA} ${it.isiB} ${it.dampak}`.toUpperCase().match(/\b[A-Z]-\d-\d{2}-(?:0|III|II|I)\b/g) || [])];
+  return disebut.length > 0 && !disebut.includes(kini) ? disebut : [];
+}
+
 // Panel inkonsistensi dokumen per klaim + pencatatan tindak lanjut (status & catatan)
 function PanelInkonsistensi({ claim, onUpdateClaim }) {
   const daftar = daftarInkonsistensi(claim);
@@ -9584,6 +9592,17 @@ function PanelInkonsistensi({ claim, onUpdateClaim }) {
               <p className="bg-[#F7F9FA] rounded px-2 py-1"><b>{it.dokumenB}</b>: {it.isiB}</p>
             </div>
             {it.dampak && <p className="text-xs text-[#5B6B76]">{it.dampak}</p>}
+            {(() => {
+              const lama = kodeLamaDiTemuan(claim, it);
+              if (!lama.length || it.status === "Sudah diperbaiki" || it.status === "Bukan masalah (sesuai)") return null;
+              return (
+                <div className="flex flex-wrap items-center gap-2 text-xs bg-[#E4F3EC] text-[#1E6B4C] rounded px-2 py-1.5">
+                  <span>✓ Kode sudah diganti ({lama.join(", ")} → {claim.inacbgCode}) — kemungkinan sudah diperbaiki.</span>
+                  {onUpdateClaim && <button type="button" onClick={() => simpanTL(it.key, { status: "Sudah diperbaiki", catatan: `Kode ${lama.join(", ")} diganti ${claim.inacbgCode}` })}
+                    className="px-2 py-0.5 rounded bg-[#1E6B4C] text-white font-semibold">Tandai sudah diperbaiki</button>}
+                </div>
+              );
+            })()}
             {onUpdateClaim && (
               <div className="flex flex-wrap gap-2 items-center">
                 <select value={it.status} onChange={(e) => simpanTL(it.key, { status: e.target.value })} className="text-xs rounded border border-[#D7DEE3] px-2 py-1 bg-white">
