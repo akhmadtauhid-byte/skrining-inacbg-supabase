@@ -9135,6 +9135,12 @@ function LembarKodingEklaim({ claim }) {
     if (gantiDU || dihapus.length || sek.some((d) => d.baru) || pr.some((p) => p.baru)) usulan = { du: duBaru, sek, pr, dihapus };
   }
   const v = versi === "usulan" && usulan ? usulan : klaim;
+  // Perkiraan kode INA-CBG menurut pola riwayat grouping (RS sendiri, atau pola acuan) untuk
+  // kombinasi diagnosis utama + ada/tidak tindakan + jumlah dx sekunder + kelas rawat versi ini.
+  const rw = v.du.code ? findRiwayatInacbgPresisi(v.du.code, v.pr.length > 0, v.sek.length, claim.kelasRawat) : null;
+  const rwTarif = rw ? tarifResmiUntuk(rw.kode, claim.kelasRawat) : null;
+  const rwDesk = rw ? ((TARIF_REF_MAP[rw.kode] && TARIF_REF_MAP[rw.kode][1]) || rw.deskripsi) : "";
+  const rwBeda = rw && claim.inacbgCode && up(claim.inacbgCode) !== up(rw.kode);
   const salin = (teks, label) => {
     const ok = () => { setTersalin(label); setTimeout(() => setTersalin(""), 2000); };
     try { navigator.clipboard.writeText(teks).then(ok, () => window.prompt("Salin teks berikut:", teks)); } catch (e) { window.prompt("Salin teks berikut:", teks); }
@@ -9156,6 +9162,7 @@ function LembarKodingEklaim({ claim }) {
     `Diagnosis utama: ${v.du.code || "-"}${v.du.desc ? " - " + v.du.desc : ""}`,
     "Diagnosis sekunder:", ...(v.sek.length ? v.sek.map((d, i) => `${i + 1}. ${d.code}${d.desc ? " - " + d.desc : ""}`) : ["-"]),
     "Tindakan (ICD-9-CM):", ...(v.pr.length ? v.pr.map((p, i) => `${i + 1}. ${p.code}${p.desc ? " - " + p.desc : ""}`) : ["-"]),
+    ...(rw ? [`Perkiraan INA-CBG (pola riwayat, ${rw.jml}x preseden): ${rw.kode} - ${rwDesk}${rwTarif ? ` · Rp${rwTarif.toLocaleString("id-ID")}` : ""} — konfirmasi dengan grouper e-Klaim`] : []),
   ].join("\n");
   const kodeDx = [v.du.code, ...v.sek.map((d) => d.code)].filter(Boolean).join("#");
   const kodePr = v.pr.map((p) => p.code).join("#");
@@ -9181,6 +9188,16 @@ function LembarKodingEklaim({ claim }) {
         <div><p className="text-[11px] text-[#94A3AC] mb-1">Tindakan / prosedur (ICD-9-CM)</p>
           {v.pr.length ? <ul className="space-y-1">{v.pr.map((p, i) => <Baris key={p.code + i} no={i + 1} it={p} />)}</ul> : <p className="text-xs text-[#94A3AC]">tidak ada</p>}</div>
         {v.dihapus && v.dihapus.length > 0 && <p className="text-[11px] text-[#B3261E]">Disarankan dihapus: {v.dihapus.map((d) => `${d.code} (${d.ket})`).join(", ")}</p>}
+        <div className="border-t border-[#E2E8ED] pt-2">
+          <p className="text-[11px] text-[#94A3AC] mb-1">Perkiraan kode INA-CBG {versi === "usulan" ? "(untuk usulan ini)" : ""} — menurut pola riwayat grouping</p>
+          {rw ? (
+            <div className="space-y-1">
+              <ul><Baris it={{ code: rw.kode, desc: `${rwDesk}${rwTarif ? ` · Rp${rwTarif.toLocaleString("id-ID")} (Kelas ${claim.kelasRawat || "3"})` : ""}` }} /></ul>
+              <p className="text-[10px] text-[#5B6B76]">{rw.jml}x preseden {rw.sumber === "acuan" ? "pada pola grouping acuan" : "di riwayat RS ini"} untuk {v.du.code} {v.pr.length ? "dengan" : "tanpa"} tindakan{rw.presisi ? `, ${v.sek.length >= 2 ? "2+" : v.sek.length} dx sekunder` : ""}{Number(rw.kelasRawat) !== Number(claim.kelasRawat || 3) ? ` (preseden Kelas ${rw.kelasRawat})` : ""}. Kode final tetap dari grouper e-Klaim.</p>
+              {rwBeda && <p className="text-[11px] text-[#9A6300]">Berbeda dengan kode tercatat {claim.inacbgCode} — cek ulang diagnosis/tindakan/severity di e-Klaim.</p>}
+            </div>
+          ) : <p className="text-xs text-[#94A3AC]">Belum ada preseden untuk {v.du.code || "diagnosis ini"} — jalankan grouper e-Klaim.</p>}
+        </div>
         {claim.inacbgCode && versi === "klaim" && <p className="text-[11px] text-[#5B6B76]">Hasil grouping tercatat: <b className="font-mono">{claim.inacbgCode}</b>{parseAngka(claim.tarifKlaim) ? ` · Rp${parseAngka(claim.tarifKlaim).toLocaleString("id-ID")}` : ""}</p>}
         <div className="flex flex-wrap gap-1.5 pt-1">
           <button type="button" className={tombol} onClick={() => salin(teksLembar(), "lembar")}>{tersalin === "lembar" ? "Tersalin ✓" : "Salin lembar koding"}</button>
