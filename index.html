@@ -6050,7 +6050,14 @@ function bacaRisikoPendingAI(teks, status) {
   if (status !== "done" || !teks) return { level: null, alasan: "" };
   const m = String(teks).match(/Risiko\s+Pending\s*:?\s*\**\s*:?\s*\**\s*(TINGGI|SEDANG|RENDAH)\b\**\s*[—–\-:]*\s*([^\n]*)/i);
   if (!m) return { level: null, alasan: "" };
-  return { level: m[1].toUpperCase(), alasan: m[2].replace(/[*_\[\]]+/g, "").trim().slice(0, 300) };
+  const mentah = m[2].replace(/[*_\[\]]+/g, "").trim();
+  let alasan = mentah.replace(/^[\s,;:.\-—–]+/, "").trim();
+  if (alasan.length < 20 || /^[,;:.]/.test(mentah)) {
+    // format jawaban tidak rapi → pakai poin pertama "Area yang Perlu Diverifikasi"
+    const poin = String(teks).match(/Area yang Perlu Diverifikasi[^\n]*\n+\s*1\.\s*([^\n]+)/i);
+    if (poin) alasan = poin[1].replace(/[*_\[\]]+/g, "").trim();
+  }
+  return { level: m[1].toUpperCase(), alasan: alasan.slice(0, 300) };
 }
 
 // ============================================================================
@@ -7010,9 +7017,13 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   //      yang TIDAK DIJAMIN sama sekali menurut matriks resmi.
   if (claim.dariIGD) {
     const losJam = Number(claim.igdLosJam);
-    if (!claim.igdKriteriaGawatDarurat) {
+    const buktiGD = claim.igdKriteriaGawatDarurat ? [] : deteksiGawatDarurat(claim);
+    if (!claim.igdKriteriaGawatDarurat && buktiGD.length > 0) {
+      notes.push({ id: "igdKriteriaTerdeteksi", label: "Kriteria gawat darurat terdeteksi dari dokumen klaim", detail: `Kotak "Memenuhi kriteria Gawat Darurat" belum dicentang, tetapi dokumen klaim mencatat: ${buktiGD.join("; ")}. Kriteria gawat darurat dianggap terpenuhi — pastikan tercatat juga di lembar triase IGD, lalu centang kotak itu di Edit (✏) untuk konfirmasi.` });
+    } else if (!claim.igdKriteriaGawatDarurat) {
       add("igdMismatch", `Klaim asal IGD ditandai belum memenuhi kriteria gawat darurat. Menurut Matriks Penjaminan Klaim IGD (Lampiran BA Kemenkes-BPJS No. 3760/2024), kasus IGD idealnya memenuhi salah satu kriteria gawat darurat (ancam nyawa, gangguan napas/sirkulasi, penurunan kesadaran, gangguan hemodinamik, atau perlu tindakan segera) — ada baiknya dicek ulang dan didokumentasikan di lembar triase sebelum diajukan, supaya tidak berisiko dipertanyakan sebagai kasus non-emergency.`);
-    } else if (claim.jenisRawat !== "Rawat Jalan" && !isNaN(losJam) && losJam < 6 && !claim.igdDirujuk) {
+    }
+    if ((claim.igdKriteriaGawatDarurat || buktiGD.length > 0) && claim.jenisRawat !== "Rawat Jalan" && claim.igdLosJam !== "" && claim.igdLosJam != null && !isNaN(losJam) && losJam < 6 && !claim.igdDirujuk) {
       add("igdMismatch", `Klaim IGD diklaim sebagai Rawat Inap, tapi lama pelayanan IGD tercatat ${losJam} jam (<6 jam) dan pasien tidak dirujuk. Menurut matriks resmi, penjaminan sebagai RITL memerlukan salah satu: pelayanan IGD >6 jam, ATAU telah memenuhi indikasi medis rawat inap dan menempati ruang perawatan dengan visitasi DPJP — pastikan salah satu syarat ini terdokumentasi (Resume Medis DPJP, asuhan keperawatan IGD).`);
     }
   }
@@ -7277,6 +7288,53 @@ async function analyzeClinicalText(clinicalText, jenisKasus, jenisRawat) {
 }
 
 
+
+// Tarif resmi dari tabel tarif RS yang login, untuk kode INA-CBG + kelas rawat.
+// Rawat jalan hanya punya satu tarif. null = kode tidak ada / tarif tidak tersedia.
+function tarifResmiUntuk(kode, kelas) {
+  const row = TARIF_REF_MAP[String(kode || "").trim().toUpperCase()];
+  if (!row) return null;
+  if (row[2] === "RJ") return row[3] || null;
+  const k = String(kelas || "3");
+  const v = k === "1" ? row[5] : k === "2" ? row[4] : row[3];
+  return v || null;
+}
+
+// Bukti kriteria gawat darurat (Matriks Penjaminan IGD, BA 3760/2024) yang TERTULIS di
+// ringkasan klinis / diagnosis klaim. Dipakai supaya klaim IGD dengan kondisi gawat yang
+// terdokumentasi tidak ditandai "belum memenuhi kriteria" hanya karena kotak belum dicentang.
+function deteksiGawatDarurat(claim) {
+  const teks = String(claim.resumeMedis || "");
+  const bukti = [];
+  const negasi = (idx) => /(tidak|tanpa|tdk|bukan|disangkal|negatif)\s+(ada\s+)?$/i.test(teks.slice(Math.max(0, idx - 18), idx));
+  const kata = [
+    [/penurunan kesadaran|tidak sadar|somnolen|sopor|stupor|koma\b|delirium/i, "penurunan kesadaran"],
+    [/syok|shock|renjatan/i, "syok"],
+    [/henti jantung|cardiac arrest|henti napas|apne(a|u)\b|RJP|resusitasi jantung/i, "henti jantung/napas"],
+    [/gagal napas|distres(s)? (napas|pernapasan)|respiratory (failure|distress)|sianosis/i, "gangguan napas"],
+    [/kejang|status epileptikus|konvulsi/i, "kejang"],
+    [/intubasi|ventilator|ETT\b/i, "tindakan jalan napas segera"],
+    [/perdarahan (aktif|masif|intraserebral|intrakranial)|hematemesis|ICH\b/i, "perdarahan berat"],
+    [/STEMI|infark miokard akut/i, "sindrom koroner akut"],
+  ];
+  kata.forEach(([re, nama]) => {
+    const m = re.exec(teks);
+    if (m && !negasi(m.index)) bukti.push(nama);
+  });
+  const gcs = teks.match(/GCS\s*[:=]?\s*(\d{1,2})(?!\d)/i) || teks.match(/GCS\s*[:=]?\s*E\s*(\d)\s*[VM]?\s*(\d)\s*[VM]?\s*(\d)/i);
+  if (gcs) {
+    const nilai = gcs.length > 2 ? Number(gcs[1]) + Number(gcs[2]) + Number(gcs[3]) : Number(gcs[1]);
+    if (nilai >= 3 && nilai < 15 && !bukti.includes("penurunan kesadaran")) bukti.push(`penurunan kesadaran (GCS ${nilai})`);
+  }
+  const spo2 = teks.match(/(SpO2|SaO2|saturasi(\s+oksigen)?|sat\.?\s*O2)\s*[:=]?\s*(\d{2,3})\s*%?/i);
+  if (spo2 && Number(spo2[3]) < 90) bukti.push(`hipoksemia (SpO2 ${spo2[3]}%)`);
+  const td = teks.match(/(TD|tekanan darah)\s*[:=]?\s*(\d{2,3})\s*\/\s*\d{2,3}/i);
+  if (td && Number(td[2]) < 90) bukti.push(`hipotensi (TD ${td[2]}/…)`);
+  const dx = [claim.primaryDxCode, ...(claim.secondaryDx || []).map((d) => d.code)].map((c) => String(c || "").toUpperCase());
+  if (dx.some((c) => /^(I46|R57|J96\.0|J80|R40\.2|I21|I6[0-2]|G41|T78\.2|R65\.1|E1[0-4]\.0|E1[0-4]\.1|O15)/.test(c))) bukti.push("diagnosis kegawatan (kode ICD-10)");
+  return [...new Set(bukti)];
+}
+
 async function runClaimAI(claim, allClaims) {
   const officialRef = TARIF_REF_MAP[claim.inacbgCode];
   const officialDesc = officialRef ? officialRef[1] : null;
@@ -7458,6 +7516,13 @@ function emptyClaim() {
 function InputManual({ onAdd }) {
   const [claim, setClaim] = useState(emptyClaim());
   const set = (field) => (val) => setClaim((c) => ({ ...c, [field]: val }));
+  const tarifOtomatis = useRef(true);
+  const setKodeKelas = (field) => (val) => setClaim((c) => {
+    const baru = { ...c, [field]: field === "inacbgCode" ? String(val).toUpperCase() : val };
+    const t = tarifResmiUntuk(baru.inacbgCode, baru.kelasRawat);
+    if (t && (tarifOtomatis.current || !c.tarifKlaim)) { baru.tarifKlaim = String(t); tarifOtomatis.current = true; }
+    return baru;
+  });
 
   // Bantuan AI: analisis deskripsi klinis bebas jadi saran koding
   const [clinicalText, setClinicalText] = useState("");
@@ -7596,9 +7661,13 @@ function InputManual({ onAdd }) {
           <SelectField label="Jenis Kasus" value={claim.jenisKasus} onChange={set("jenisKasus")} options={["Medis", "Bedah"]} />
           <SelectField label="Jenis Perawatan" value={claim.jenisRawat} onChange={set("jenisRawat")} options={["Rawat Inap", "Rawat Jalan"]} />
           <SelectField label="Severity Level" value={claim.severityLevel} onChange={set("severityLevel")} options={["I", "II", "III"]} />
-          <TextField label="Kode INA-CBG" value={claim.inacbgCode} onChange={set("inacbgCode")} mono placeholder="boleh dikosongkan dulu — isi setelah e-Klaim grouping" />
-          <SelectField label="Kelas Rawat" value={claim.kelasRawat} onChange={set("kelasRawat")} options={[{ value: "3", label: "Kelas 3" }, { value: "2", label: "Kelas 2" }, { value: "1", label: "Kelas 1" }]} />
-          <TextField label="Tarif Klaim (Rp)" type="number" value={claim.tarifKlaim} onChange={set("tarifKlaim")} placeholder="boleh dikosongkan dulu" />
+          <TextField label="Kode INA-CBG" value={claim.inacbgCode} onChange={setKodeKelas("inacbgCode")} mono placeholder="boleh dikosongkan dulu — isi setelah e-Klaim grouping" />
+          <SelectField label="Kelas Rawat" value={claim.kelasRawat} onChange={setKodeKelas("kelasRawat")} options={[{ value: "3", label: "Kelas 3" }, { value: "2", label: "Kelas 2" }, { value: "1", label: "Kelas 1" }]} />
+          <div>
+            <TextField label="Tarif Klaim (Rp)" type="number" value={claim.tarifKlaim} onChange={(v) => { tarifOtomatis.current = false; set("tarifKlaim")(v); }} placeholder="terisi otomatis dari kode INA-CBG" />
+            <InfoTarifOtomatis kode={claim.inacbgCode} kelas={claim.kelasRawat} tarif={claim.tarifKlaim} otomatis={tarifOtomatis.current}
+              onIsi={(t) => { tarifOtomatis.current = true; set("tarifKlaim")(String(t)); }} />
+          </div>
         </div>
       </Section>
 
@@ -7806,7 +7875,7 @@ function InputManual({ onAdd }) {
 
       <div className="flex justify-end gap-2">
         <button type="button" onClick={() => {
-          setClaim(emptyClaim());
+          (tarifOtomatis.current = true, setClaim(emptyClaim()));
           setClinicalText("");
           setAnalysisResult(null);
           setAnalysisError("");
@@ -7825,7 +7894,7 @@ function InputManual({ onAdd }) {
             penjamin: claim.sepPenjamin, noTelepon: claim.sepNoTelepon, catatan: claim.sepCatatan,
           } : null;
           onAdd({ ...claim, sep });
-          setClaim(emptyClaim());
+          (tarifOtomatis.current = true, setClaim(emptyClaim()));
           // Reset juga panel Bantuan AI — kalau tidak, teks & saran diagnosis pasien
           // SEBELUMNYA masih tampil saat mulai input pasien berikutnya, bikin rancu
           // seolah AI "membaca" data pasien lama.
@@ -8926,6 +8995,16 @@ function PanelSaranKoding({ claim, onUpdateClaim }) {
   );
 }
 
+
+// Keterangan di bawah kolom tarif: asal angka & tombol isi dari tabel tarif RS
+function InfoTarifOtomatis({ kode, kelas, tarif, otomatis, onIsi }) {
+  const t = tarifResmiUntuk(kode, kelas);
+  if (!String(kode || "").trim()) return null;
+  if (!t) return <span className="block text-[11px] text-[#94A3AC] mt-1">Kode tidak ada di tabel tarif RS — isi tarif sesuai e-Klaim.</span>;
+  if (otomatis && parseAngka(tarif) === t) return <span className="block text-[11px] text-[#1E6B4C] mt-1">Terisi otomatis dari tabel tarif RS ({labelTarif()}). Ubah bila ada top-up/special CMG.</span>;
+  return <button type="button" onClick={() => onIsi(t)} className="block text-[11px] text-[#0B7285] font-semibold mt-1 hover:underline">Isi dari tabel tarif: Rp{t.toLocaleString("id-ID")}</button>;
+}
+
 function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfirmSeparate, onUpdateClaim }) {
   const loading = claim.aiStatus === "loading";
   const [editing, setEditing] = useState(false);
@@ -8940,13 +9019,25 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
       sepDokter: s.dokter || "", sepSubSpesialis: s.subSpesialis || "", sepFaskesPerujuk: s.faskesPerujuk || "",
       sepDiagnosaAwal: s.diagnosaAwal || "", sepJenisKunjungan: s.jenisKunjungan || "", sepPoliPerujuk: s.poliPerujuk || "",
       sepKelasHak: s.kelasHak || "", sepPenjamin: s.penjamin || "", sepNoTelepon: s.noTelepon || "", sepCatatan: s.catatan || "",
+      dariIGD: !!claim.dariIGD, igdKriteriaGawatDarurat: !!claim.igdKriteriaGawatDarurat, igdDirujuk: !!claim.igdDirujuk, igdLosJam: claim.igdLosJam || "",
+      _tarifOtomatis: !claim.tarifKlaim || parseAngka(claim.tarifKlaim) === tarifResmiUntuk(claim.inacbgCode, claim.kelasRawat),
     });
     setEditing(true);
+  };
+  // Kode/kelas berubah → tarif klaim ikut tabel tarif RS, kecuali sudah diketik manual
+  const ubahKodeKelas = (ubah) => {
+    setEditForm((f) => {
+      const baru = { ...f, ...ubah };
+      const t = tarifResmiUntuk(baru.inacbgCode, baru.kelasRawat);
+      if (t && (f._tarifOtomatis || !f.tarifKlaim)) { baru.tarifKlaim = String(t); baru._tarifOtomatis = true; }
+      return baru;
+    });
   };
   const saveEdit = () => {
     const { sepNoSep, sepTglSep, sepNoKartu, sepDokter, sepSubSpesialis, sepFaskesPerujuk,
       sepDiagnosaAwal, sepJenisKunjungan, sepPoliPerujuk, sepKelasHak, sepPenjamin, sepNoTelepon, sepCatatan,
-      ...rest } = editForm;
+      _tarifOtomatis, ...rest } = editForm;
+    if (!rest.dariIGD) { rest.igdKriteriaGawatDarurat = false; rest.igdDirujuk = false; rest.igdLosJam = ""; }
     const sep = {
       noSep: sepNoSep.trim(), tglSep: sepTglSep.trim(), noKartu: sepNoKartu.trim(), dokter: sepDokter.trim(),
       subSpesialis: sepSubSpesialis.trim(), faskesPerujuk: sepFaskesPerujuk.trim(), diagnosaAwal: sepDiagnosaAwal.trim(),
@@ -8979,15 +9070,44 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
             <p className="text-xs text-[#5B6B76]">Berguna terutama untuk mengisi kode INA-CBG setelah proses grouping e-Klaim selesai.</p>
             <div className="grid grid-cols-2 gap-3">
               <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Kode INA-CBG</span>
-                <input value={editForm.inacbgCode} onChange={(e) => setEditForm({ ...editForm, inacbgCode: e.target.value })} placeholder="mis. A-4-10-III" className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm font-mono" /></label>
+                <input value={editForm.inacbgCode} onChange={(e) => ubahKodeKelas({ inacbgCode: e.target.value.toUpperCase() })} placeholder="mis. A-4-10-III" className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm font-mono" /></label>
               <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Kelas Rawat</span>
-                <select value={editForm.kelasRawat} onChange={(e) => setEditForm({ ...editForm, kelasRawat: e.target.value })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm bg-white">
+                <select value={editForm.kelasRawat} onChange={(e) => ubahKodeKelas({ kelasRawat: e.target.value })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm bg-white">
                   <option value="3">Kelas 3</option><option value="2">Kelas 2</option><option value="1">Kelas 1</option></select></label>
               <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Severity</span>
                 <select value={editForm.severityLevel} onChange={(e) => setEditForm({ ...editForm, severityLevel: e.target.value })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm bg-white">
                   <option value="I">I</option><option value="II">II</option><option value="III">III</option></select></label>
               <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Tarif Klaim (Rp)</span>
-                <input type="number" value={editForm.tarifKlaim} onChange={(e) => setEditForm({ ...editForm, tarifKlaim: e.target.value })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" /></label>
+                <input type="number" value={editForm.tarifKlaim} onChange={(e) => setEditForm({ ...editForm, tarifKlaim: e.target.value, _tarifOtomatis: false })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" />
+                <InfoTarifOtomatis kode={editForm.inacbgCode} kelas={editForm.kelasRawat} tarif={editForm.tarifKlaim} otomatis={editForm._tarifOtomatis}
+                  onIsi={(t) => setEditForm({ ...editForm, tarifKlaim: String(t), _tarifOtomatis: true })} /></label>
+            </div>
+
+            <div className="border-t border-[#E2E8ED] pt-3">
+              <p className="text-sm font-semibold text-[#0F2A3D]">Data IGD</p>
+              <p className="text-xs text-[#5B6B76] mb-2">Dicek terhadap Matriks Penjaminan Klaim IGD (BA Kemenkes-BPJS No. 3760/2024).</p>
+              <label className="flex items-start gap-2 mb-2 cursor-pointer">
+                <input type="checkbox" checked={editForm.dariIGD} onChange={(e) => setEditForm({ ...editForm, dariIGD: e.target.checked })} className="mt-0.5 w-4 h-4 accent-[#0B7285]" />
+                <span className="text-sm text-[#334652]">Klaim ini berasal dari pelayanan IGD.</span>
+              </label>
+              {editForm.dariIGD && (
+                <div className="ml-6 space-y-2">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input type="checkbox" checked={editForm.igdKriteriaGawatDarurat} onChange={(e) => setEditForm({ ...editForm, igdKriteriaGawatDarurat: e.target.checked })} className="mt-0.5 w-4 h-4 accent-[#0B7285]" />
+                    <span className="text-sm text-[#334652]">Memenuhi salah satu kriteria Gawat Darurat (ancam nyawa, gangguan jalan napas/napas/sirkulasi, penurunan kesadaran, gangguan hemodinamik, atau perlu tindakan segera).</span>
+                  </label>
+                  {!editForm.igdKriteriaGawatDarurat && (() => {
+                    const bukti = deteksiGawatDarurat(claim);
+                    return bukti.length > 0 ? <p className="text-xs text-[#1E6B4C] bg-[#E4F3EC] rounded px-2 py-1">Terdeteksi di dokumen klaim: {bukti.join("; ")} — centang kotak di atas bila sesuai.</p> : null;
+                  })()}
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input type="checkbox" checked={editForm.igdDirujuk} onChange={(e) => setEditForm({ ...editForm, igdDirujuk: e.target.checked })} className="mt-0.5 w-4 h-4 accent-[#0B7285]" />
+                    <span className="text-sm text-[#334652]">Pasien dirujuk ke faskes lain.</span>
+                  </label>
+                  <label className="block max-w-[200px]"><span className="block text-xs text-[#5B6B76] mb-1">Lama pelayanan di IGD (jam)</span>
+                    <input type="number" value={editForm.igdLosJam} onChange={(e) => setEditForm({ ...editForm, igdLosJam: e.target.value })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" /></label>
+                </div>
+              )}
             </div>
 
             <div className="border-t border-[#E2E8ED] pt-3">
@@ -9840,6 +9960,12 @@ export default function App() {
               <Save size={14} /> Simpan Data
             </button>
             {saveMsg && <span className="text-[11px] text-[#7FA8B5]">{saveMsg}</span>}
+            {!statusServer.ok && <span className="text-[11px] text-[#FFB4A9] max-w-xs text-right">{statusServer.pesan}</span>}
+            {PROFIL && <span className="text-[11px] text-[#A9C1CA] text-right">{PROFIL.nama} · {LABEL_PERAN[PROFIL.peran] || PROFIL.peran}<br />{PROFIL.rs.nama}{kuota ? ` · kuota AI ${kuota.sisa}/${kuota.total}` : ""}</span>}
+            <div className="flex gap-1.5">
+              <button onClick={muatUlang} title="Muat ulang data dari server" className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-[11px] font-semibold border border-white/20"><RefreshCw size={12} /> Muat ulang</button>
+              <button onClick={keluarAplikasi} title="Keluar" className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-[11px] font-semibold border border-white/20"><LogOut size={12} /> Keluar</button>
+            </div>
           </div>
         </div>
       </header>
