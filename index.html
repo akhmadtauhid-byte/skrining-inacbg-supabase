@@ -9090,6 +9090,109 @@ function KodeResmiDisebutAI({ teks, kelas }) {
   );
 }
 
+
+// Lembar Input Koding e-Klaim: diagnosis utama, sekunder & tindakan (ICD-9-CM) yang siap
+// disalin ke aplikasi e-Klaim/berkas BPJS. Bisa menampilkan data klaim saat ini, atau
+// USULAN setelah rekomendasi AI (ditandai jelas belum diverifikasi).
+function LembarKodingEklaim({ claim }) {
+  const [tersalin, setTersalin] = useState("");
+  const [versi, setVersi] = useState("klaim");
+  const up = (x) => String(x || "").trim().toUpperCase();
+  const deskDx = (code, desc) => {
+    if (String(desc || "").trim()) return desc;
+    const c = findICD10Category3(code);
+    return c.known ? `${c.title} (kategori)` : "";
+  };
+  const deskPr = (code, desc) => {
+    if (String(desc || "").trim()) return desc;
+    const f = findICD9ProcExact(code);
+    if (f.known) return f.title;
+    const k = findICD9Category(code);
+    return k.valid ? `${k.title} (kategori)` : "";
+  };
+  const klaim = {
+    du: { code: claim.primaryDxCode, desc: deskDx(claim.primaryDxCode, claim.primaryDxDesc) },
+    sek: (claim.secondaryDx || []).filter((d) => (d.code || "").trim()).map((d) => ({ code: d.code.trim(), desc: deskDx(d.code, d.desc) })),
+    pr: (claim.procedures || []).filter((p) => (p.code || "").trim()).map((p) => ({ code: p.code.trim(), desc: deskPr(p.code, p.desc) })),
+    dihapus: [],
+  };
+  // usulan setelah saran AI (tanpa mengubah klaim)
+  let usulan = null;
+  const sa = claim.aiStatus === "done" && claim.aiAnalysis ? bacaSaranKodingAI(claim.aiAnalysis) : null;
+  if (sa) {
+    const du = sa.diagnosisUtama || {};
+    const gantiDU = !!du.kodeSaran && up(du.kodeSaran) !== up(claim.primaryDxCode);
+    const hapus = new Set((sa.diagnosisSekunderHapus || []).filter((d) => d && d.kode).map((d) => up(d.kode)));
+    const prHapus = new Set((sa.prosedurHapus || []).filter((p) => p && p.kode).map((p) => up(p.kode)));
+    const duBaru = gantiDU ? { code: String(du.kodeSaran).trim(), desc: deskDx(du.kodeSaran, du.deskripsi), baru: true } : klaim.du;
+    let sek = klaim.sek.filter((d) => !hapus.has(up(d.code)) && up(d.code) !== up(duBaru.code));
+    (sa.diagnosisSekunderTambah || []).filter((d) => d && d.kode).forEach((d) => { if (!sek.some((x) => up(x.code) === up(d.kode)) && up(d.kode) !== up(duBaru.code)) sek.push({ code: String(d.kode).trim(), desc: deskDx(d.kode, d.deskripsi), baru: true }); });
+    let pr = klaim.pr.filter((p) => !prHapus.has(up(p.code)));
+    (sa.prosedurTambah || []).filter((p) => p && p.kode).forEach((p) => { if (!pr.some((x) => up(x.code) === up(p.kode))) pr.push({ code: String(p.kode).trim(), desc: deskPr(p.kode, p.deskripsi), baru: true }); });
+    const dihapus = [...(gantiDU ? [{ code: klaim.du.code, ket: "diagnosis utama lama" }] : []),
+      ...klaim.sek.filter((d) => hapus.has(up(d.code))).map((d) => ({ code: d.code, ket: "dx sekunder" })),
+      ...klaim.pr.filter((p) => prHapus.has(up(p.code))).map((p) => ({ code: p.code, ket: "tindakan" }))];
+    if (gantiDU || dihapus.length || sek.some((d) => d.baru) || pr.some((p) => p.baru)) usulan = { du: duBaru, sek, pr, dihapus };
+  }
+  const v = versi === "usulan" && usulan ? usulan : klaim;
+  const salin = (teks, label) => {
+    const ok = () => { setTersalin(label); setTimeout(() => setTersalin(""), 2000); };
+    try { navigator.clipboard.writeText(teks).then(ok, () => window.prompt("Salin teks berikut:", teks)); } catch (e) { window.prompt("Salin teks berikut:", teks); }
+  };
+  const Kode = ({ code, baru }) => (
+    <button type="button" onClick={() => salin(code, code)} title="Klik untuk menyalin kode"
+      className={`font-mono font-semibold px-1.5 py-0.5 rounded border text-xs ${baru ? "bg-[#E4F3EC] border-[#BFE3D1] text-[#1E6B4C]" : "bg-white border-[#D7DEE3] text-[#0F2A3D]"} hover:border-[#0B7285]`}>
+      {tersalin === code ? "Tersalin ✓" : code}
+    </button>
+  );
+  const Baris = ({ no, it }) => (
+    <li className="flex items-start gap-2 text-xs">
+      {no != null && <span className="text-[#94A3AC] w-4 text-right shrink-0 pt-0.5">{no}.</span>}
+      <Kode code={it.code} baru={it.baru} />
+      <span className="text-[#334652] pt-0.5">{it.desc || <i className="text-[#94A3AC]">deskripsi tidak ada di referensi — cek di e-Klaim</i>}{it.baru && <b className="text-[#1E6B4C]"> · saran AI</b>}</span>
+    </li>
+  );
+  const teksLembar = () => [
+    `Diagnosis utama: ${v.du.code || "-"}${v.du.desc ? " - " + v.du.desc : ""}`,
+    "Diagnosis sekunder:", ...(v.sek.length ? v.sek.map((d, i) => `${i + 1}. ${d.code}${d.desc ? " - " + d.desc : ""}`) : ["-"]),
+    "Tindakan (ICD-9-CM):", ...(v.pr.length ? v.pr.map((p, i) => `${i + 1}. ${p.code}${p.desc ? " - " + p.desc : ""}`) : ["-"]),
+  ].join("\n");
+  const kodeDx = [v.du.code, ...v.sek.map((d) => d.code)].filter(Boolean).join("#");
+  const kodePr = v.pr.map((p) => p.code).join("#");
+  const tombol = "text-[11px] font-semibold px-2 py-1 rounded border border-[#D7DEE3] bg-white text-[#334652] hover:bg-[#F4F9FA]";
+  return (
+    <div className="border border-[#CFE4E8] rounded-lg overflow-hidden">
+      <div className="bg-[#0B7285] text-white text-sm font-semibold px-3 py-2 flex flex-wrap items-center gap-2">
+        <span>Lembar Input Koding e-Klaim</span>
+        <span className="font-normal text-xs text-[#CFE9EE]">— klik kode untuk menyalin</span>
+        {usulan && (
+          <span className="ml-auto flex gap-1">
+            <button type="button" onClick={() => setVersi("klaim")} className={`text-[11px] px-2 py-0.5 rounded ${versi === "klaim" ? "bg-white text-[#0B7285]" : "bg-white/15"}`}>Data klaim</button>
+            <button type="button" onClick={() => setVersi("usulan")} className={`text-[11px] px-2 py-0.5 rounded ${versi === "usulan" ? "bg-white text-[#0B7285]" : "bg-white/15"}`}>Usulan setelah saran AI</button>
+          </span>
+        )}
+      </div>
+      {versi === "usulan" && usulan && <p className="text-[11px] bg-[#FBF8F0] text-[#9A6300] px-3 py-1.5">Usulan ini BELUM diverifikasi — pastikan setiap kode baru didukung rekam medis & disetujui DPJP sebelum diinput ke e-Klaim.</p>}
+      <div className="p-3 space-y-2.5">
+        <div><p className="text-[11px] text-[#94A3AC] mb-1">Diagnosis utama (ICD-10)</p>
+          {v.du.code ? <ul><Baris it={v.du} /></ul> : <p className="text-xs text-[#94A3AC]">belum diisi</p>}</div>
+        <div><p className="text-[11px] text-[#94A3AC] mb-1">Diagnosis sekunder (ICD-10)</p>
+          {v.sek.length ? <ul className="space-y-1">{v.sek.map((d, i) => <Baris key={d.code + i} no={i + 1} it={d} />)}</ul> : <p className="text-xs text-[#94A3AC]">tidak ada</p>}</div>
+        <div><p className="text-[11px] text-[#94A3AC] mb-1">Tindakan / prosedur (ICD-9-CM)</p>
+          {v.pr.length ? <ul className="space-y-1">{v.pr.map((p, i) => <Baris key={p.code + i} no={i + 1} it={p} />)}</ul> : <p className="text-xs text-[#94A3AC]">tidak ada</p>}</div>
+        {v.dihapus && v.dihapus.length > 0 && <p className="text-[11px] text-[#B3261E]">Disarankan dihapus: {v.dihapus.map((d) => `${d.code} (${d.ket})`).join(", ")}</p>}
+        {claim.inacbgCode && versi === "klaim" && <p className="text-[11px] text-[#5B6B76]">Hasil grouping tercatat: <b className="font-mono">{claim.inacbgCode}</b>{parseAngka(claim.tarifKlaim) ? ` · Rp${parseAngka(claim.tarifKlaim).toLocaleString("id-ID")}` : ""}</p>}
+        <div className="flex flex-wrap gap-1.5 pt-1">
+          <button type="button" className={tombol} onClick={() => salin(teksLembar(), "lembar")}>{tersalin === "lembar" ? "Tersalin ✓" : "Salin lembar koding"}</button>
+          {kodeDx && <button type="button" className={tombol} onClick={() => salin(kodeDx, "dx")}>{tersalin === "dx" ? "Tersalin ✓" : `Salin semua diagnosis (${kodeDx.split("#").length})`}</button>}
+          {kodePr && <button type="button" className={tombol} onClick={() => salin(kodePr, "pr")}>{tersalin === "pr" ? "Tersalin ✓" : `Salin semua tindakan (${kodePr.split("#").length})`}</button>}
+        </div>
+        <p className="text-[10px] text-[#94A3AC]">"Salin semua" memakai pemisah # (format bridging e-Klaim, mis. I61.9#R40.2). Deskripsi bertanda "(kategori)" = judul kategori 3 karakter ICD-10; deskripsi lengkap sesuai e-Klaim.</p>
+      </div>
+    </div>
+  );
+}
+
 function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfirmSeparate, onUpdateClaim }) {
   const loading = claim.aiStatus === "loading";
   const [editing, setEditing] = useState(false);
@@ -9244,6 +9347,8 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
             <div><p className="text-xs text-[#94A3AC]">Bukti penunjang</p><p>{claim.buktiPenunjang ? "Ada" : "Belum ditandai"}</p></div>
             <div><p className="text-xs text-[#94A3AC]">Special CMG</p><p>{claim.specialCMG ? claim.specialCMGKategori : "Tidak"}</p></div>
           </div>
+
+          <LembarKodingEklaim claim={claim} />
 
           <div>
             <p className="text-sm font-semibold text-[#0F2A3D] mb-3">Tahapan Verifikasi — pola pikir digital Vedika BPJS</p>
