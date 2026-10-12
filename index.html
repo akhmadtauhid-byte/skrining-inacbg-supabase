@@ -9561,7 +9561,7 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
 function kodeLamaDiTemuan(claim, it) {
   const kini = String(claim.inacbgCode || "").trim().toUpperCase();
   if (!kini) return [];
-  const disebut = [...new Set(`${it.isiA} ${it.isiB} ${it.dampak}`.toUpperCase().match(/\b[A-Z]-\d-\d{2}-(?:0|III|II|I)\b/g) || [])];
+  const disebut = [...new Set(`${it.dokumenA} ${it.isiA} ${it.dokumenB} ${it.isiB} ${it.dampak}`.toUpperCase().match(/\b[A-Z]-\d-\d{2}-(?:0|III|II|I)\b/g) || [])];
   return disebut.length > 0 && !disebut.includes(kini) ? disebut : [];
 }
 
