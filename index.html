@@ -5553,12 +5553,76 @@ async function muatRiwayatRS() {
   RIWAYAT_INFO = { periode: "", jumlah: 0, diubah: "" };
   if (!supabase || !PROFIL) return;
   const { data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah").eq("rs_id", PROFIL.rs.id).maybeSingle();
-  if (error || !data) return;
-  DAFTAR_RIWAYAT_DIAGNOSIS_INACBG = Array.isArray(data.diagnosis) ? data.diagnosis : [];
-  DAFTAR_RIWAYAT_PRESISI = Array.isArray(data.presisi) ? data.presisi : [];
-  DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT = Array.isArray(data.dx_sekunder) ? data.dx_sekunder : [];
-  RIWAYAT_INFO = { periode: data.periode || "", jumlah: data.jumlah_klaim || 0, diubah: data.diubah || "" };
+  if (!error && data) {
+    DAFTAR_RIWAYAT_DIAGNOSIS_INACBG = Array.isArray(data.diagnosis) ? [...data.diagnosis] : [];
+    DAFTAR_RIWAYAT_PRESISI = Array.isArray(data.presisi) ? [...data.presisi] : [];
+    DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT = Array.isArray(data.dx_sekunder) ? [...data.dx_sekunder] : [];
+    RIWAYAT_INFO = { periode: data.periode || "", jumlah: data.jumlah_klaim || 0, diubah: data.diubah || "" };
+  }
+  await gabungRiwayatAcuan();
 }
+
+// Pola grouping ACUAN: riwayat grouper e-Klaim sungguhan dari RS rujukan (versi tervalidasi
+// dokter spesialis). Logika grouper INA-CBG (diagnosis/prosedur → kode) berlaku NASIONAL —
+// yang berbeda antar RS hanya tarifnya. Jadi pola kode acuan dipakai untuk diagnosis yang
+// belum ada di riwayat RS sendiri, sedangkan tarif SELALU dihitung ulang dari tabel tarif
+// RS yang login. Riwayat RS sendiri tetap diutamakan (tidak pernah ditimpa).
+// Penanda di akhir baris: "acuan" (diagnosis: indeks 7, presisi: indeks 8, dx sekunder: indeks 5).
+let RIWAYAT_ACUAN_INFO = { jumlah: 0, periode: "", dipakai: 0 };
+async function gabungRiwayatAcuan() {
+  RIWAYAT_ACUAN_INFO = { jumlah: 0, periode: "", dipakai: 0 };
+  if (!supabase) return;
+  const { data, error } = await supabase.from("riwayat_acuan").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim").eq("id", 1).maybeSingle();
+  if (error || !data) return;
+  RIWAYAT_ACUAN_INFO.jumlah = data.jumlah_klaim || 0;
+  RIWAYAT_ACUAN_INFO.periode = data.periode || "";
+  const desk = (kode, d) => (TARIF_REF_MAP[kode] ? TARIF_REF_MAP[kode][1] : d);
+  const adaD = new Set(DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.map((r) => `${r[0]}|${r[1]}|${r[2]}`));
+  (data.diagnosis || []).forEach((r) => {
+    if (adaD.has(`${r[0]}|${r[1]}|${r[2]}`)) return;
+    DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.push([r[0], r[1], r[2], r[3], desk(r[3], r[4]), r[5], tarifResmiUntuk(r[3], r[2]) || 0, "acuan"]);
+    RIWAYAT_ACUAN_INFO.dipakai += 1;
+  });
+  const adaP = new Set(DAFTAR_RIWAYAT_PRESISI.map((r) => `${r[0]}|${r[1]}|${r[2]}|${r[3]}`));
+  (data.presisi || []).forEach((r) => {
+    if (adaP.has(`${r[0]}|${r[1]}|${r[2]}|${r[3]}`)) return;
+    DAFTAR_RIWAYAT_PRESISI.push([r[0], r[1], r[2], r[3], r[4], desk(r[4], r[5]), r[6], tarifResmiUntuk(r[4], r[3]) || 0, "acuan"]);
+  });
+  const duSendiri = new Set(DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.map((r) => r[0]));
+  (data.dx_sekunder || []).forEach((r) => {
+    if (duSendiri.has(r[0])) return;   // RS sudah punya pola dx sekunder sendiri utk dx utama ini
+    DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.push([r[0], r[1], r[2], r[3], r[4], "acuan"]);
+  });
+}
+
+// B. Kode INA-CBG yang tidak lazim untuk diagnosis utama (dibanding pola grouping riwayat
+// RS sendiri + acuan). Hanya dibandingkan dalam jenis kasus yang sama (medis "-4-" vs medis,
+// prosedur vs prosedur) supaya tindakan operasi yang sah tidak ikut ditandai.
+function cekKodeVsRiwayat(claim) {
+  const kode = String(claim.inacbgCode || "").trim().toUpperCase();
+  const dx = String(claim.primaryDxCode || "").trim().toUpperCase();
+  if (!/^[A-Z]-\d-\d{2}-/.test(kode) || !dx) return null;
+  const baris = DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.filter((r) => r[0] === dx);
+  const total = baris.reduce((n, r) => n + (Number(r[5]) || 0), 0);
+  if (total < 5) return null;
+  const dasar = (k) => String(k).split("-").slice(0, 3).join("-");
+  const jenis = (k) => String(k).split("-")[1];
+  const dasarKlaim = dasar(kode);
+  if (!["4", "5"].includes(jenis(kode))) return null;   // kode prosedur ditentukan tindakannya, bukan diagnosis
+  const sejenis = baris.filter((r) => jenis(r[3]) === jenis(kode));
+  if (!sejenis.length || sejenis.some((r) => dasar(r[3]) === dasarKlaim)) return null;
+  const peta = {};
+  sejenis.forEach((r) => { const d = dasar(r[3]); peta[d] = peta[d] || { kode: r[3], deskripsi: r[4], jml: 0 }; peta[d].jml += Number(r[5]) || 0; });
+  const lazim = Object.values(peta).sort((a, b) => b.jml - a.jml);
+  const deskKlaim = TARIF_REF_MAP[kode] ? TARIF_REF_MAP[kode][1] : "";
+  const acuan = sejenis.some((r) => r[7] === "acuan");
+  const teksLazim = lazim.slice(0, 3).map((x) => `${x.kode.split("-").slice(0, 3).join("-")} (${x.deskripsi.replace(/\s*\((RINGAN|SEDANG|BERAT)\)$/, "")}, ${x.jml}x)`).join("; ");
+  return {
+    acuan,
+    ringkas: `Kode ${kode}${deskKlaim ? ` (${deskKlaim})` : ""} tidak lazim untuk diagnosis utama ${dx} — pada ${total} klaim grouper e-Klaim ${acuan ? "pola acuan" : "riwayat RS ini"}, ${dx} dikelompokkan ke: ${teksLazim}.`,
+  };
+}
+
 
 // Cari kode INA-CBG dari riwayat klaim nyata RS ini berdasarkan kode diagnosis + ADA/TIDAKNYA
 // prosedur + kelas rawat. Fallback bertingkat: (1) kecocokan persis, (2) kelas rawat lain tapi
@@ -5625,11 +5689,11 @@ function findRiwayatInacbgPresisi(primaryDxCode, adaProsedur, jumlahDiagnosisSek
 
   // 4. Fallback terakhir: tabel dasar (dx + ada-prosedur + kelas, tanpa bucket sekunder)
   const umum = findRiwayatInacbg(primaryDxCode, adaProsedur, kelasRawat);
-  if (umum) return { dxUtama: umum[0], adaProsedur: umum[1], kelasRawat: umum[2], kode: umum[3], deskripsi: umum[4], jml: umum[5], tarifMedian: umum[6], presisi: false };
+  if (umum) return { dxUtama: umum[0], adaProsedur: umum[1], kelasRawat: umum[2], kode: umum[3], deskripsi: umum[4], jml: umum[5], tarifMedian: umum[6], presisi: false, sumber: umum[7] || "rs" };
   return null;
 }
 function arrToRiwayatPresisi(r) {
-  return { dxUtama: r[0], adaProsedur: r[1], bucket: r[2], kelasRawat: r[3], kode: r[4], deskripsi: r[5], jml: r[6], tarifMedian: r[7] };
+  return { dxUtama: r[0], adaProsedur: r[1], bucket: r[2], kelasRawat: r[3], kode: r[4], deskripsi: r[5], jml: r[6], tarifMedian: r[7], sumber: r[8] || "rs" };
 }
 
 // DAFTAR_POLA_PENDING_RS_INI: kini disimpan per RS di database (diisi lewat Admin RS) dan disisipkan ke instruksi AI di server.
@@ -6850,6 +6914,8 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   // 0. Sistem pengaman data — cek kewajaran seluruh field kritis (lihat sanityCheckClaim)
   notes.push(...sanityCheckClaim(claim));
   notes.push(...sepCompletenessCheck(claim));
+  const kodeTL = cekKodeVsRiwayat(claim);
+  if (kodeTL) notes.push({ id: "kodeTidakLazimDx", label: "Kode INA-CBG tidak lazim untuk diagnosis utama ini", detail: `${kodeTL.ringkas} Periksa kembali pemilihan diagnosis utama/prosedur di e-Klaim sebelum diajukan.` });
 
   // 1. Severity tinggi tanpa dx sekunder pendukung — hanya relevan utk rawat inap
   //    (rawat jalan umumnya tidak punya gradasi severity, kode INACBG-nya berakhiran -0)
@@ -7379,8 +7445,8 @@ async function runClaimAI(claim, allClaims) {
 - Diagnosis utama: ${claim.primaryDxCode} - ${claim.primaryDxDesc}${dxCatTitle ? ` (kategori ICD-10 resmi: ${dxCatTitle})` : ""}
 - Diagnosis sekunder: ${(claim.secondaryDx || []).map((d) => `${d.code} (${d.desc})`).join("; ") || "tidak ada"}
 - Prosedur: ${(claim.procedures || []).map((p) => `${p.code} (${p.desc})`).join("; ") || "tidak ada"}
-- Kode INA-CBG: ${kodeKosong ? "BELUM DIISI" : claim.inacbgCode}${officialDesc ? ` — deskripsi RESMI menurut tabel tarif Permenkes No. 3/2023: "${officialDesc}"` : (!kodeKosong ? " (kode tidak ditemukan di tabel tarif referensi sistem)" : "")}
-${kodeKosong && riwayatRS ? `- Riwayat klaim RS ini (data historis, PALING otoritatif — ${riwayatRS[5]}x preseden nyata${RIWAYAT_INFO.periode ? " " + RIWAYAT_INFO.periode : ""}, ${adaProsedurKlaim ? "dengan" : "tanpa"} prosedur): kode "${riwayatRS[3]}" (${riwayatRS[4]}) paling sering dipakai utk diagnosis "${claim.primaryDxCode}" di Kelas ${riwayatRS[2]}, tarif median Rp${Number(riwayatRS[6]).toLocaleString("id-ID")}\n` : ""}${kodeKosong && riwayatPasien.length > 0 ? `- Riwayat pasien ini di sistem (episode sebelumnya dgn diagnosis utama sama, No. RM ${claim.noRM}): ${riwayatPasien.map((c) => `kode "${c.inacbgCode}" dipakai pada ${c.tglMasuk || "?"} (severity ${c.severityLevel}, LOS ${c.los} hari, tarif waktu itu Rp${parseAngka(c.tarifKlaim).toLocaleString("id-ID")})`).join("; ")}\n` : ""}${kodeKosong && candidates.length > 0 ? `- Kandidat kode dari tabel tarif resmi (berdasarkan kemiripan kata kunci diagnosis, BUKAN hasil grouper — cuma bahan pertimbangan; tarif ditampilkan sesuai Kelas Rawat pasien = Kelas ${claim.kelasRawat || "3"}): ${candidates.map((c) => {
+- Kode INA-CBG: ${kodeKosong ? "BELUM DIISI" : claim.inacbgCode}${officialDesc ? ` — deskripsi RESMI menurut tabel tarif Permenkes No. 3/2023: "${officialDesc}"` : (!kodeKosong ? " (kode tidak ditemukan di tabel tarif referensi sistem)" : "")}${(() => { const tl = !kodeKosong && cekKodeVsRiwayat(claim); return tl ? `\n- Pemeriksaan otomatis kode vs pola grouping: ${tl.ringkas}` : ""; })()}
+${kodeKosong && riwayatRS && riwayatRS[7] === "acuan" ? `- Pola grouping acuan sistem (data historis grouper e-Klaim sungguhan, ${riwayatRS[5]}x preseden di RS rujukan — logika grouper INA-CBG berlaku nasional; PALING otoritatif karena riwayat RS ini sendiri belum mencakup diagnosis ini; ${adaProsedurKlaim ? "dengan" : "tanpa"} prosedur): kode "${riwayatRS[3]}" (${riwayatRS[4]}) paling sering dipakai utk diagnosis "${claim.primaryDxCode}" di Kelas ${riwayatRS[2]}${riwayatRS[6] ? `, tarif resmi RS ini Rp${Number(riwayatRS[6]).toLocaleString("id-ID")}` : ""}\n` : ""}${kodeKosong && riwayatRS && riwayatRS[7] !== "acuan" ? `- Riwayat klaim RS ini (data historis, PALING otoritatif — ${riwayatRS[5]}x preseden nyata${RIWAYAT_INFO.periode ? " " + RIWAYAT_INFO.periode : ""}, ${adaProsedurKlaim ? "dengan" : "tanpa"} prosedur): kode "${riwayatRS[3]}" (${riwayatRS[4]}) paling sering dipakai utk diagnosis "${claim.primaryDxCode}" di Kelas ${riwayatRS[2]}, tarif median Rp${Number(riwayatRS[6]).toLocaleString("id-ID")}\n` : ""}${kodeKosong && riwayatPasien.length > 0 ? `- Riwayat pasien ini di sistem (episode sebelumnya dgn diagnosis utama sama, No. RM ${claim.noRM}): ${riwayatPasien.map((c) => `kode "${c.inacbgCode}" dipakai pada ${c.tglMasuk || "?"} (severity ${c.severityLevel}, LOS ${c.los} hari, tarif waktu itu Rp${parseAngka(c.tarifKlaim).toLocaleString("id-ID")})`).join("; ")}\n` : ""}${kodeKosong && candidates.length > 0 ? `- Kandidat kode dari tabel tarif resmi (berdasarkan kemiripan kata kunci diagnosis, BUKAN hasil grouper — cuma bahan pertimbangan; tarif ditampilkan sesuai Kelas Rawat pasien = Kelas ${claim.kelasRawat || "3"}): ${candidates.map((c) => {
     const jenisRefRIRJ = c[2];
     const tarifPerKelas = jenisRefRIRJ === "RJ" ? c[3] : { "3": c[3], "2": c[4], "1": c[5] }[claim.kelasRawat || "3"];
     return `${c[0]} = "${c[1]}"${tarifPerKelas ? ` (perkiraan tarif Rp${Number(tarifPerKelas).toLocaleString("id-ID")})` : ""}`;
@@ -7520,7 +7586,7 @@ function InputManual({ onAdd }) {
   const setKodeKelas = (field) => (val) => setClaim((c) => {
     const baru = { ...c, [field]: field === "inacbgCode" ? String(val).toUpperCase() : val };
     const t = tarifResmiUntuk(baru.inacbgCode, baru.kelasRawat);
-    if (t && (tarifOtomatis.current || !c.tarifKlaim)) { baru.tarifKlaim = String(t); tarifOtomatis.current = true; }
+    if (t && (tarifOtomatis.current || !parseAngka(c.tarifKlaim))) { baru.tarifKlaim = String(t); tarifOtomatis.current = true; }
     return baru;
   });
 
@@ -7690,9 +7756,9 @@ function InputManual({ onAdd }) {
             const kelasBeda = riwayat.kelasRawat !== Number(claim.kelasRawat || 3);
             return (
               <div className="mb-4 bg-[#E4F3EC] border border-[#BFE3D1] rounded-lg p-3.5">
-                <p className="text-sm font-semibold text-[#0F2A3D] mb-1">✅ Berdasarkan Riwayat Klaim RS Ini ({riwayat.jml}x preseden nyata)</p>
+                <p className="text-sm font-semibold text-[#0F2A3D] mb-1">✅ {riwayat.sumber === "acuan" ? "Berdasarkan Pola Grouping Acuan" : "Berdasarkan Riwayat Klaim RS Ini"} ({riwayat.jml}x preseden nyata)</p>
                 <p className="text-xs text-[#5B6B76] mb-3">
-                  Kode ini paling sering dipakai untuk diagnosis "{claim.primaryDxCode}" <b>{adaProsedur ? "DENGAN prosedur/tindakan" : "TANPA prosedur (kontrol/konservatif)"}</b>{riwayat.presisi ? `, ${jmlSekunder === 0 ? "tanpa diagnosis sekunder" : jmlSekunder === 1 ? "1 diagnosis sekunder" : "2+ diagnosis sekunder"}` : ""} — di klaim RS Anda sendiri ({RIWAYAT_INFO.periode ? RIWAYAT_INFO.periode + ", " : ""}hasil grouper e-Klaim sungguhan){kelasBeda ? ` — preseden dari Kelas ${riwayat.kelasRawat} (kelas rawat Anda belum ada datanya)` : ""}.
+                  Kode ini paling sering dipakai untuk diagnosis "{claim.primaryDxCode}" <b>{adaProsedur ? "DENGAN prosedur/tindakan" : "TANPA prosedur (kontrol/konservatif)"}</b>{riwayat.presisi ? `, ${jmlSekunder === 0 ? "tanpa diagnosis sekunder" : jmlSekunder === 1 ? "1 diagnosis sekunder" : "2+ diagnosis sekunder"}` : ""}{riwayat.sumber === "acuan" ? ` — dari pola grouping acuan sistem (${RIWAYAT_ACUAN_INFO.jumlah.toLocaleString("id-ID")} klaim hasil grouper e-Klaim sungguhan di RS rujukan; logika grouper berlaku nasional, tarif sesuai tabel tarif RS Anda)` : ` — di klaim RS Anda sendiri (${RIWAYAT_INFO.periode ? RIWAYAT_INFO.periode + ", " : ""}hasil grouper e-Klaim sungguhan)`}{kelasBeda ? ` — preseden dari Kelas ${riwayat.kelasRawat} (kelas rawat Anda belum ada datanya)` : ""}.
                   {!riwayat.presisi && " Belum ada preseden sepresisi itu — kode di bawah dari pola diagnosis + status prosedur yang sama, jumlah diagnosis sekunder dilonggarkan."}
                 </p>
                 <button type="button" onClick={() => setClaim((cl) => ({ ...cl, inacbgCode: riwayat.kode, tarifKlaim: String(riwayat.tarifMedian) }))}
@@ -9005,6 +9071,25 @@ function InfoTarifOtomatis({ kode, kelas, tarif, otomatis, onIsi }) {
   return <button type="button" onClick={() => onIsi(t)} className="block text-[11px] text-[#0B7285] font-semibold mt-1 hover:underline">Isi dari tabel tarif: Rp{t.toLocaleString("id-ID")}</button>;
 }
 
+
+// Daftar deskripsi RESMI (tabel tarif RS) untuk setiap kode INA-CBG yang disebut AI —
+// supaya salah-sebut nama kode oleh AI langsung kelihatan oleh koder.
+function KodeResmiDisebutAI({ teks, kelas }) {
+  const kode = [...new Set((String(teks || "").match(/\b[A-Z]-\d-\d{2}-(?:0|III|II|I)\b/g) || []))].slice(0, 8);
+  if (!kode.length) return null;
+  return (
+    <div className="mt-2 text-xs bg-white border border-[#E2E8ED] rounded-lg p-2.5">
+      <p className="font-semibold text-[#0F2A3D] mb-1">Deskripsi resmi kode yang disebut AI (tabel tarif RS, Kelas {kelas || "3"})</p>
+      <ul className="space-y-0.5">
+        {kode.map((k) => {
+          const r = TARIF_REF_MAP[k]; const t = tarifResmiUntuk(k, kelas);
+          return <li key={k}><span className="font-mono font-semibold">{k}</span> — {r ? r[1] : <span className="text-[#B3261E]">tidak ada di tabel tarif RS ini — perlu dicek di e-Klaim</span>}{t ? ` · Rp${t.toLocaleString("id-ID")}` : ""}</li>;
+        })}
+      </ul>
+    </div>
+  );
+}
+
 function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfirmSeparate, onUpdateClaim }) {
   const loading = claim.aiStatus === "loading";
   const [editing, setEditing] = useState(false);
@@ -9020,8 +9105,11 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
       sepDiagnosaAwal: s.diagnosaAwal || "", sepJenisKunjungan: s.jenisKunjungan || "", sepPoliPerujuk: s.poliPerujuk || "",
       sepKelasHak: s.kelasHak || "", sepPenjamin: s.penjamin || "", sepNoTelepon: s.noTelepon || "", sepCatatan: s.catatan || "",
       dariIGD: !!claim.dariIGD, igdKriteriaGawatDarurat: !!claim.igdKriteriaGawatDarurat, igdDirujuk: !!claim.igdDirujuk, igdLosJam: claim.igdLosJam || "",
-      _tarifOtomatis: !claim.tarifKlaim || parseAngka(claim.tarifKlaim) === tarifResmiUntuk(claim.inacbgCode, claim.kelasRawat),
+      _tarifOtomatis: !parseAngka(claim.tarifKlaim) || parseAngka(claim.tarifKlaim) === tarifResmiUntuk(claim.inacbgCode, claim.kelasRawat),
     });
+    // kode sudah ada tapi tarif masih kosong/0 → langsung isi dari tabel tarif RS
+    const tAwal = tarifResmiUntuk(claim.inacbgCode, claim.kelasRawat);
+    if (tAwal && !parseAngka(claim.tarifKlaim)) setEditForm((f) => ({ ...f, tarifKlaim: String(tAwal), _tarifOtomatis: true }));
     setEditing(true);
   };
   // Kode/kelas berubah → tarif klaim ikut tabel tarif RS, kecuali sudah diketik manual
@@ -9029,7 +9117,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
     setEditForm((f) => {
       const baru = { ...f, ...ubah };
       const t = tarifResmiUntuk(baru.inacbgCode, baru.kelasRawat);
-      if (t && (f._tarifOtomatis || !f.tarifKlaim)) { baru.tarifKlaim = String(t); baru._tarifOtomatis = true; }
+      if (t && (f._tarifOtomatis || !parseAngka(f.tarifKlaim))) { baru.tarifKlaim = String(t); baru._tarifOtomatis = true; }
       return baru;
     });
   };
@@ -9288,6 +9376,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
               </div>
             )}
             {claim.aiStatus === "done" && claim.aiAnalysis && <p className="text-sm text-[#334652] bg-[#F4F9FA] rounded-lg p-3 whitespace-pre-wrap">{teksOpiniTanpaBlok(claim.aiAnalysis)}</p>}
+            {claim.aiStatus === "done" && claim.aiAnalysis && <KodeResmiDisebutAI teks={teksOpiniTanpaBlok(claim.aiAnalysis)} kelas={claim.kelasRawat} />}
             {claim.aiStatus === "done" && claim.aiAnalysis && <PanelSaranKoding claim={claim} onUpdateClaim={onUpdateClaim} />}
             <PanelInkonsistensi claim={claim} onUpdateClaim={onUpdateClaim} />
             {claim.aiStatus === "idle" && !loading && (
@@ -10693,6 +10782,15 @@ function PanelRiwayatGrouping() {
   return (
     <Section title="Riwayat Grouping RS" subtitle="Saran kode INA-CBG & diagnosis sekunder yang sering menyertai, dipelajari dari klaim nyata RS Anda sendiri">
       {kabarEl}
+      <p className="text-xs bg-[#E4F3EC] text-[#1E6B4C] rounded-lg px-3 py-2 mb-3">Pola grouping acuan sistem{RIWAYAT_ACUAN_INFO.jumlah ? ` (${RIWAYAT_ACUAN_INFO.jumlah.toLocaleString("id-ID")} klaim${RIWAYAT_ACUAN_INFO.periode ? ", " + RIWAYAT_ACUAN_INFO.periode : ""})` : ""} {RIWAYAT_ACUAN_INFO.jumlah ? `aktif — melengkapi ${RIWAYAT_ACUAN_INFO.dipakai} pola diagnosis yang belum ada di riwayat RS ini. Riwayat RS sendiri selalu diutamakan; tarif selalu dari tabel tarif RS ini.` : "belum tersedia."}</p>
+      {PROFIL && PROFIL.peran === "superadmin" && RIWAYAT_INFO.jumlah > 0 && (
+        <button type="button" onClick={async () => {
+          if (!window.confirm(`Jadikan riwayat grouping ${PROFIL.rs.nama} (${RIWAYAT_INFO.jumlah.toLocaleString("id-ID")} klaim) sebagai POLA ACUAN untuk semua RS? Yang dibagikan hanya pasangan diagnosis → kode INA-CBG + jumlah kejadian (tanpa data pasien & tanpa tarif).`)) return;
+          const tanpaTarif = (arr, iTarif) => arr.filter((r) => r[r.length - 1] !== "acuan").map((r) => r.map((v, i) => (i === iTarif ? 0 : v)));
+          const { error } = await supabase.from("riwayat_acuan").upsert({ id: 1, diagnosis: tanpaTarif(DAFTAR_RIWAYAT_DIAGNOSIS_INACBG, 6), presisi: tanpaTarif(DAFTAR_RIWAYAT_PRESISI, 7), dx_sekunder: DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.filter((r) => r[5] !== "acuan"), periode: RIWAYAT_INFO.periode, jumlah_klaim: RIWAYAT_INFO.jumlah, sumber: PROFIL.rs.kode, diubah: new Date().toISOString() }, { onConflict: "id" });
+          if (error) kabar(false, error.message); else { await muatRiwayatRS(); kabar(true, "Pola acuan diperbarui — langsung dipakai semua RS saat login berikutnya."); }
+        }} className="mb-3 text-xs font-semibold text-[#0B7285] hover:underline">Jadikan riwayat RS ini pola acuan untuk semua RS (superadmin)</button>
+      )}
       <p className="text-sm text-[#334652] mb-3">Saat ini: {RIWAYAT_INFO.jumlah ? <b>{RIWAYAT_INFO.jumlah.toLocaleString("id-ID")} klaim{RIWAYAT_INFO.periode ? " · " + RIWAYAT_INFO.periode : ""}</b> : <b>belum ada data</b>} · {DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.length} pola diagnosis, {DAFTAR_RIWAYAT_PRESISI.length} pola presisi, {DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.length} pasangan dx sekunder</p>
       <form onSubmit={unggah} className="space-y-2">
         <div className="flex flex-wrap gap-2 items-end">
