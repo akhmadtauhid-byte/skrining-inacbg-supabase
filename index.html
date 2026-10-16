@@ -28,7 +28,7 @@ import {
   AlertTriangle, CheckCircle2, Upload, FileText, X, Loader2,
   Download, Search, Plus, Trash2, ShieldAlert, ShieldQuestion,
   ShieldCheck, Info, Sparkles, Activity, ClipboardList, Users,
-  Sliders, RotateCcw, BookOpen, Save, Printer, Pencil, LogOut, RefreshCw, UserCog, Building2
+  Sliders, RotateCcw, BookOpen, Save, Printer, Pencil, LogOut, RefreshCw, UserCog, Building2, Lock, Unlock
 } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 
@@ -56,6 +56,107 @@ const LABEL_PERAN = { superadmin: "Superadmin", admin_rs: "Admin RS", koder: "Ko
 function bolehTulis() { return !!PROFIL && ["superadmin", "admin_rs", "koder"].includes(PROFIL.peran); }
 function adminRS() { return !!PROFIL && ["superadmin", "admin_rs"].includes(PROFIL.peran); }
 function namaRSAktif() { return (PROFIL && PROFIL.rs && PROFIL.rs.nama) || "Rumah Sakit"; }
+
+/* ---- v7: SAMARKAN IDENTITAS PASIEN pada cetak / unduh / teks salin ----
+   Bawaan AKTIF. No. RM -> ****56, nama -> inisial (Ny. S. R.), No. Kartu/SEP/telepon -> ****1234.
+   Diterapkan ke seluruh isi keluaran (termasuk teks temuan & opini AI yang menyebut No. RM/nama). */
+let SAMAR_ID = true;
+try { if (localStorage.getItem("samar_identitas") === "0") SAMAR_ID = false; } catch (e) { /* abaikan */ }
+const _pendengarSamar = new Set();
+function setSamarIdentitas(v) {
+  SAMAR_ID = !!v;
+  try { localStorage.setItem("samar_identitas", SAMAR_ID ? "1" : "0"); } catch (e) { /* abaikan */ }
+  _pendengarSamar.forEach((f) => f(SAMAR_ID));
+}
+const _GELAR = /^(tn|ny|nn|an|by|bayi|sdr|sdri|bp|bpk|ibu|nyonya|tuan|nona)\.?$/i;
+function samarNomor(x, sisa = 2) {
+  const t = String(x == null ? "" : x).trim();
+  if (!t || t === "-") return t;
+  if (t.length <= sisa) return "*".repeat(t.length);
+  return "****" + t.slice(-sisa);
+}
+function inisialNama(n) {
+  const t = String(n || "").trim();
+  if (!t || t === "-") return t;
+  return t.split(/\s+/).map((k) => {
+    if (_GELAR.test(k)) return k.endsWith(".") ? k : k + ".";
+    const h = k.replace(/[^A-Za-zÀ-ɏ]/g, "");
+    return h ? h[0].toUpperCase() + "." : "";
+  }).filter(Boolean).join(" ");
+}
+function _escRe(x) { return x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function _polaSamar(claims) {
+  const pola = [];
+  const tambahNama = (nm) => {
+    if (nm.length < 3) return;
+    const ganti = inisialNama(nm);
+    pola.push([new RegExp(_escRe(nm), "gi"), ganti]);
+    const esc = escHtml(nm);
+    if (esc !== nm) pola.push([new RegExp(_escRe(esc), "gi"), ganti]);
+  };
+  (claims || []).forEach((c) => {
+    if (!c) return;
+    const sep = c.sep || {};
+    ["noKartu", "noSep", "noTelepon"].forEach((f) => {
+      const v = String(sep[f] || "").trim();
+      if (v.length >= 5 && v !== "-") pola.push([new RegExp(_escRe(v), "g"), samarNomor(v, 4)]);
+    });
+    const rm = String(c.noRM || "").trim();
+    if (rm.length >= 2) pola.push([new RegExp("(^|[^0-9A-Za-z])" + _escRe(rm) + "(?![0-9A-Za-z])", "g"), (m, p) => p + samarNomor(rm)]);
+    const nm = String(c.namaPasien || "").trim();
+    tambahNama(nm);
+    const tanpaGelar = nm.split(/\s+/).filter((k) => !_GELAR.test(k)).join(" ");
+    if (tanpaGelar !== nm && tanpaGelar.length >= 4) tambahNama(tanpaGelar);
+  });
+  return pola;
+}
+function samarkanTeks(teks, claims) {
+  if (!SAMAR_ID || teks == null || teks === "") return teks;
+  let t = String(teks);
+  _polaSamar(claims).forEach(([re, g]) => { t = t.replace(re, g); });
+  return t;
+}
+function samarkanBaris(rows, claims) {
+  if (!SAMAR_ID) return rows;
+  const pola = _polaSamar(claims);
+  return rows.map((r) => {
+    const o = {};
+    Object.keys(r).forEach((k) => {
+      let v = r[k];
+      if (typeof v === "string" && v) pola.forEach(([re, g]) => { v = v.replace(re, g); });
+      o[k] = v;
+    });
+    return o;
+  });
+}
+function siapKeluar(html, claims) {
+  if (!SAMAR_ID) return html;
+  const tanda = `<div style="font-family:Arial,sans-serif;font-size:9px;color:#5B6B76;background:#EEF6F0;border:1px solid #CDE5D4;border-radius:4px;padding:3px 8px;margin:6px 8px;">&#128274; Identitas pasien disamarkan (No. RM, nama, No. Kartu/SEP). Data lengkap hanya di sistem.</div>`;
+  return samarkanTeks(html, claims).replace(/<body([^>]*)>/i, (m) => m + tanda);
+}
+function useSamarIdentitas() {
+  const [v, setV] = useState(SAMAR_ID);
+  useEffect(() => { _pendengarSamar.add(setV); return () => { _pendengarSamar.delete(setV); }; }, []);
+  return [v, setSamarIdentitas];
+}
+function ToggleSamar({ ringkas }) {
+  const [v, set] = useSamarIdentitas();
+  const judul = v ? "Identitas pasien DISAMARKAN saat cetak/unduh/salin (klik untuk tampilkan lengkap)" : "Identitas pasien TAMPIL LENGKAP saat cetak/unduh/salin (klik untuk samarkan)";
+  if (ringkas) {
+    return (
+      <button type="button" onClick={() => set(!v)} title={judul}
+        className={`p-1.5 rounded-lg hover:bg-[#F0F3F5] ${v ? "text-[#1E6B4C]" : "text-[#9A6300]"}`}>
+        {v ? <Lock size={18} /> : <Unlock size={18} />}
+      </button>
+    );
+  }
+  return (
+    <label title={judul} className={`inline-flex items-center gap-1.5 text-xs cursor-pointer select-none px-2 py-1 rounded-lg border ${v ? "border-[#CDE5D4] bg-[#EEF6F0] text-[#1E6B4C]" : "border-[#F0E6C8] bg-[#FBF8F0] text-[#9A6300]"}`}>
+      <input type="checkbox" checked={v} onChange={(e) => set(e.target.checked)} />
+      {v ? <Lock size={13} /> : <Unlock size={13} />} Samarkan No. RM &amp; nama
+    </label>
+  );
+}
 
 // Satu-satunya jalur ke AI: Edge Function "skrining-ai" (cek login, kuota, susun
 // instruksi di server, catat pemakaian). Tidak ada API key/instruksi AI di browser.
@@ -6480,7 +6581,7 @@ function eksporRekapRekomendasi(claims, hanyaAda) {
     r.query.forEach((q) => rows.push({ ...dasar, kategori: "Query DPJP", jenis: "", kode: "", temuan_uraian: q, saran: "", bukti: "", unit: "DPJP", sumber: "AI", ...isi }));
   });
   if (!rows.length) { alert("Tidak ada rekomendasi untuk diekspor pada cakupan ini."); return; }
-  const ws = XLSX.utils.json_to_sheet(rows);
+  const ws = XLSX.utils.json_to_sheet(samarkanBaris(rows, claims));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Rekap Rekomendasi");
   XLSX.writeFile(wb, `rekap_rekomendasi_inacbg_${new Date().toISOString().slice(0, 10)}.xlsx`);
@@ -6503,7 +6604,7 @@ function ModalRekapRekomendasi({ claims, tampil, onClose }) {
   }, [list]);
   const cetak = () => {
     const html = rekapRekomendasiHtml(list, { hanyaAda, perDPJP, perUnit, judulCakupan: pilihan[cakupan].label });
-    bukaJendelaCetak(html, `rekap-rekomendasi-inacbg-${new Date().toISOString().slice(0, 10)}.html`);
+    bukaJendelaCetak(siapKeluar(html, list), `rekap-rekomendasi-inacbg-${new Date().toISOString().slice(0, 10)}.html`);
   };
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
@@ -6528,6 +6629,7 @@ function ModalRekapRekomendasi({ claims, tampil, onClose }) {
           <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={hanyaAda} onChange={(e) => setHanyaAda(e.target.checked)} /> Hanya klaim yang punya rekomendasi</label>
           <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={perDPJP} onChange={(e) => setPerDPJP(e.target.checked)} /> Kelompokkan per DPJP (1 lembar per dokter + tanda tangan)</label>
           <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={perUnit} onChange={(e) => setPerUnit(e.target.checked)} /> Sertakan daftar tindak lanjut per unit</label>
+          <div className="pt-1"><ToggleSamar /> <span className="text-[11px] text-[#94A3AC]">berlaku untuk cetak &amp; Excel</span></div>
         </div>
         <div className="text-xs bg-[#F4F9FA] border border-[#CFE4E8] rounded-lg p-2.5 mb-3 text-[#334652]">
           {list.length} klaim · {info.ada} punya rekomendasi · {info.dpjp} DPJP
@@ -8913,9 +9015,10 @@ function buildClaimPrintSection(claim, isLast) {
 function printClaims(claims) {
   if (!claims || claims.length === 0) return;
   const sections = claims.map((c, i) => buildClaimPrintSection(c, i === claims.length - 1)).join("");
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Cetak Berkas Skrining INA-CBG</title>
+  let html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Cetak Berkas Skrining INA-CBG</title>
     <style>@page { size: A4; margin: 0; } body { margin:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }</style>
     </head><body>${sections}</body></html>`;
+  html = siapKeluar(html, claims);
 
   // Jalur utama: coba buka tab baru & langsung print (ideal, tapi sering diblokir
   // panel artifact claude.ai karena berjalan di iframe sandbox).
@@ -8988,7 +9091,7 @@ function PanelSaranKoding({ claim, onUpdateClaim }) {
   };
 
   const salinQuery = () => {
-    const teks = `Kepada Yth. ${claim.dpjp || "DPJP"}\nPerihal: Konfirmasi dokumentasi klaim — No. RM ${claim.noRM}${claim.namaPasien ? ` (${claim.namaPasien})` : ""}${claim.tglMasuk ? `, masuk ${claim.tglMasuk}` : ""}\n\nMohon konfirmasi/kelengkapan catatan berikut di rekam medis:\n${query.map((q, i) => `${i + 1}. ${q}`).join("\n")}\n\nTerima kasih.\nTim Koding/Casemix`;
+    const teks = samarkanTeks(`Kepada Yth. ${claim.dpjp || "DPJP"}\nPerihal: Konfirmasi dokumentasi klaim — No. RM ${claim.noRM}${claim.namaPasien ? ` (${claim.namaPasien})` : ""}${claim.tglMasuk ? `, masuk ${claim.tglMasuk}` : ""}\n\nMohon konfirmasi/kelengkapan catatan berikut di rekam medis:\n${query.map((q, i) => `${i + 1}. ${q}`).join("\n")}\n\nTerima kasih.\nTim Koding/Casemix`, [claim]);
     try {
       navigator.clipboard.writeText(teks).then(() => { setDisalin(true); setTimeout(() => setDisalin(false), 2500); }, () => window.prompt("Salin teks query berikut:", teks));
     } catch (e) { window.prompt("Salin teks query berikut:", teks); }
@@ -9267,6 +9370,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
           </div>
           <div className="flex items-center gap-1">
             {!editing && <button onClick={startEdit} title="Lengkapi/ubah kode INA-CBG, kelas rawat, severity, tarif" className="p-1.5 rounded-lg hover:bg-[#F0F3F5] text-[#5B6B76]"><Pencil size={18} /></button>}
+            <ToggleSamar ringkas />
             <button onClick={() => printClaims([claim])} title="Cetak berkas" className="p-1.5 rounded-lg hover:bg-[#F0F3F5] text-[#5B6B76]"><Printer size={18} /></button>
             <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#F0F3F5]"><X size={18} /></button>
           </div>
@@ -9562,7 +9666,7 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
       skor_risiko: c.score, level_risiko: c.riskLevel, penanda: c.flags.map((f) => f.label).join(" | "),
       opini_ai: c.aiStatus === "done" ? c.aiAnalysis : "",
     }));
-    const ws = XLSX.utils.json_to_sheet(rows);
+    const ws = XLSX.utils.json_to_sheet(samarkanBaris(rows, claims));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Klaim Perlu Review");
     XLSX.writeFile(wb, "klaim_perlu_review_inacbg.xlsx");
@@ -9586,7 +9690,7 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
       pic: "",
       status_tindak_lanjut: "Belum ditindaklanjuti",
     }));
-    const ws = XLSX.utils.json_to_sheet(rows);
+    const ws = XLSX.utils.json_to_sheet(samarkanBaris(rows, claims));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Insiden Klaim");
     XLSX.writeFile(wb, "ekspor_simutu_rs_insiden_klaim.xlsx");
@@ -9616,6 +9720,7 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
       <Section title="Daftar Klaim" subtitle={`${filtered.length} dari ${claims.length} klaim ditampilkan`}
         right={
           <div className="flex flex-wrap gap-3 items-center">
+            <ToggleSamar />
             <button onClick={() => setBukaRekap(true)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-white bg-[#0B7285] hover:bg-[#095e6b] px-2.5 py-1.5 rounded-lg"><Printer size={14} /> Cetak Rekap Rekomendasi</button>
             <button onClick={() => printClaims(claims.filter((c) => c.riskLevel !== "Rendah"))} disabled={claims.filter((c) => c.riskLevel !== "Rendah").length === 0}
               className="inline-flex items-center gap-1.5 text-xs font-medium text-[#0B7285] hover:text-[#095e6b] disabled:opacity-40 disabled:cursor-not-allowed"><Printer size={14} /> Cetak Berkas Perlu-Review</button>
@@ -9787,7 +9892,7 @@ function KajianInkonsistensi({ claims, onSelect }) {
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ringkas.length ? ringkas : [{ Kelompok: "-", Nilai: "-", Jumlah: 0 }]), "Ringkasan");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.length ? data : [{ Keterangan: "Belum ada temuan" }]), "Temuan");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.length ? samarkanBaris(data, tampil.map((r) => r.claim)) : [{ Keterangan: "Belum ada temuan" }]), "Temuan");
     XLSX.writeFile(wb, `kajian_inkonsistensi_dokumen_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
@@ -9819,7 +9924,7 @@ function KajianInkonsistensi({ claims, onSelect }) {
   return (
     <div className="space-y-5">
       <Section title="Kajian Inkonsistensi Dokumen" subtitle="Ketidaksesuaian antar dokumen rekam medis yang ditemukan AI pada berkas klaim — bahan kajian mutu dokumentasi untuk Rekam Medis, PMKP & Komite Medik"
-        right={<button onClick={ekspor} className="inline-flex items-center gap-1.5 text-xs font-medium text-[#0B7285] hover:text-[#095e6b]"><Download size={14} /> Ekspor Excel</button>}>
+        right={<div className="flex flex-wrap items-center gap-3"><ToggleSamar /><button onClick={ekspor} className="inline-flex items-center gap-1.5 text-xs font-medium text-[#0B7285] hover:text-[#095e6b]"><Download size={14} /> Ekspor Excel</button></div>}>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[["Temuan", tampil.length], ["Klaim terdampak", klaimTerdampak], ["Belum ditindaklanjuti", belumTL], ["Klaim sudah dianalisis AI", `${sudahAI} / ${claims.length}`]].map(([l, v]) => (
             <div key={l} className="bg-[#F7F9FA] border border-[#E2E8ED] rounded-xl p-3"><p className="text-xs text-[#5B6B76]">{l}</p><p className="text-xl font-bold text-[#0F2A3D] mt-0.5">{v}</p></div>
