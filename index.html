@@ -41,8 +41,8 @@ import { createClient } from "@supabase/supabase-js";
    (Publishable key memang aman berada di browser — data tetap dilindungi
    login + Row Level Security. JANGAN pernah menaruh secret key di sini.)
    ====================================================================== */
-const SUPABASE_URL = "https://GANTI-PROJECT-REF.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "GANTI_DENGAN_sb_publishable_key";
+const SUPABASE_URL = "https://vpexyffgxdgrdwlwpjgg.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_dDnLBJdiKFQdDIZ0l5dApQ_L8dupIKT";
 const FUNGSI_AI_URL = `${SUPABASE_URL}/functions/v1/skrining-ai`;
 const KONFIG_BELUM_DIISI = SUPABASE_URL.includes("GANTI") || SUPABASE_PUBLISHABLE_KEY.includes("GANTI");
 const supabase = KONFIG_BELUM_DIISI ? null : createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
