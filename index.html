@@ -6035,6 +6035,24 @@ function _dxEfektifIdrg(dx) {
   if (dx.length > 1 && /^Z/.test(dx[0])) { const x = dx.slice(1).find((d) => !/^Z/.test(d)); if (x) e = x; }
   return /^Z/.test(dx[0]) && e !== dx[0] ? `${dx[0]}>${e}` : e;
 }
+// Umur pasien dari hasil ekstraksi: (1) umur_tahun, (2) dihitung dari tgl_lahir + tgl masuk,
+// (3) dibaca dari teks ringkasan klinis ("Umur: 67 th", "usia 3 bulan" → 0).
+function umurDariEkstraksi(r, tglMasuk) {
+  const angka = (v) => { const t = String(v ?? "").trim(); const m = t.match(/^(\d{1,3})/); return m && !/bl|bln|bulan|hr|hari|mgg|minggu/i.test(t) ? Number(m[1]) : (m && /bl|bln|bulan|hr|hari|mgg|minggu/i.test(t) ? 0 : null); };
+  const u = angka(r.umur_tahun);
+  if (u !== null && u <= 120) return u;
+  const lahir = String(r.tgl_lahir || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})/) || String(r.tgl_lahir || "").trim().match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})/);
+  if (lahir) {
+    const [y, m, d] = lahir[1].length === 4 ? [+lahir[1], +lahir[2], +lahir[3]] : [+lahir[3], +lahir[2], +lahir[1]];
+    const ref = /^\d{4}-\d{2}-\d{2}/.test(String(tglMasuk || "")) ? new Date(tglMasuk) : new Date();
+    let th = ref.getFullYear() - y; if (ref.getMonth() + 1 < m || (ref.getMonth() + 1 === m && ref.getDate() < d)) th -= 1;
+    if (th >= 0 && th <= 120) return th;
+  }
+  const teks = String(r.ringkasan_klinis || "");
+  const t = teks.match(/(?:umur|usia)\s*[:=]?\s*(\d{1,3})\s*(th|thn|tahun|bl|bln|bulan|hr|hari)?/i) || teks.match(/\b(\d{1,3})\s*(th|thn|tahun)\b/i);
+  if (t) { const n = Number(t[1]); if (/bl|bln|bulan|hr|hari/i.test(t[2] || "")) return 0; if (n <= 120) return n; }
+  return "";
+}
 function _umurKel(u) { const n = Number(u); return u === "" || u === null || u === undefined || isNaN(n) ? "" : n < 17 ? "A" : "D"; }
 function bangunModelIdrg(norm) {
   const B = {}, varian = {}, sevm = {}; const rows = [];
@@ -8798,7 +8816,7 @@ function BatchUpload({ onAddMany, onDone }) {
       jenisKasus: String(r.jenis_kasus || "Medis").trim() || "Medis",
       jenisRawat,
       kelasRawat: String(r.kelas_rawat || "3").trim() || "3",
-      umur: r.umur_tahun !== undefined && r.umur_tahun !== null && String(r.umur_tahun).trim() !== "" && !isNaN(Number(r.umur_tahun)) ? Number(r.umur_tahun) : "",
+      umur: umurDariEkstraksi(r, tglMasuk),
       tarifKlaim: String(parseAngka(r.tarif_klaim)),
       buktiPenunjang: String(r.bukti_penunjang || "").trim().toLowerCase() === "ya",
       specialCMG: String(r.special_cmg || "").trim().toLowerCase() === "ya",
