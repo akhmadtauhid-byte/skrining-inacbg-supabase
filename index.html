@@ -41,8 +41,8 @@ import { createClient } from "@supabase/supabase-js";
    (Publishable key memang aman berada di browser — data tetap dilindungi
    login + Row Level Security. JANGAN pernah menaruh secret key di sini.)
    ====================================================================== */
-const SUPABASE_URL = "https://vpexyffgxdgrdwlwpjgg.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_dDnLBJdiKFQdDIZ0l5dApQ_L8dupIKT";
+const SUPABASE_URL = "https://GANTI-PROJECT-REF.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "GANTI_DENGAN_sb_publishable_key";
 const FUNGSI_AI_URL = `${SUPABASE_URL}/functions/v1/skrining-ai`;
 const KONFIG_BELUM_DIISI = SUPABASE_URL.includes("GANTI") || SUPABASE_PUBLISHABLE_KEY.includes("GANTI");
 const supabase = KONFIG_BELUM_DIISI ? null : createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
@@ -5652,8 +5652,11 @@ let RIWAYAT_INFO = { periode: "", jumlah: 0, diubah: "" };
 async function muatRiwayatRS() {
   DAFTAR_RIWAYAT_DIAGNOSIS_INACBG = []; DAFTAR_RIWAYAT_PRESISI = []; DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT = [];
   RIWAYAT_INFO = { periode: "", jumlah: 0, diubah: "" };
+  PENDING_RS = null; IDRG_RS = null;
   if (!supabase || !PROFIL) return;
-  const { data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah").eq("rs_id", PROFIL.rs.id).maybeSingle();
+  let { data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah, pending, idrg").eq("rs_id", PROFIL.rs.id).maybeSingle();
+  if (error) ({ data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah").eq("rs_id", PROFIL.rs.id).maybeSingle());
+  if (!error && data) { PENDING_RS = data.pending && data.pending.kunci ? data.pending : null; IDRG_RS = data.idrg && data.idrg.pola ? data.idrg : null; }
   if (!error && data) {
     DAFTAR_RIWAYAT_DIAGNOSIS_INACBG = Array.isArray(data.diagnosis) ? [...data.diagnosis] : [];
     DAFTAR_RIWAYAT_PRESISI = Array.isArray(data.presisi) ? [...data.presisi] : [];
@@ -5672,9 +5675,13 @@ async function muatRiwayatRS() {
 let RIWAYAT_ACUAN_INFO = { jumlah: 0, periode: "", dipakai: 0 };
 async function gabungRiwayatAcuan() {
   RIWAYAT_ACUAN_INFO = { jumlah: 0, periode: "", dipakai: 0 };
+  PENDING_ACUAN = null; IDRG_ACUAN = null;
   if (!supabase) return;
-  const { data, error } = await supabase.from("riwayat_acuan").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim").eq("id", 1).maybeSingle();
+  let { data, error } = await supabase.from("riwayat_acuan").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, pending, idrg").eq("id", 1).maybeSingle();
+  if (error) ({ data, error } = await supabase.from("riwayat_acuan").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim").eq("id", 1).maybeSingle());
   if (error || !data) return;
+  PENDING_ACUAN = data.pending && data.pending.kunci ? data.pending : null;
+  IDRG_ACUAN = data.idrg && data.idrg.pola ? data.idrg : null;
   RIWAYAT_ACUAN_INFO.jumlah = data.jumlah_klaim || 0;
   RIWAYAT_ACUAN_INFO.periode = data.periode || "";
   const desk = (kode, d) => (TARIF_REF_MAP[kode] ? TARIF_REF_MAP[kode][1] : d);
@@ -5797,6 +5804,184 @@ function arrToRiwayatPresisi(r) {
   return { dxUtama: r[0], adaProsedur: r[1], bucket: r[2], kelasRawat: r[3], kode: r[4], deskripsi: r[5], jml: r[6], tarifMedian: r[7], sumber: r[8] || "rs" };
 }
 
+/* ======================================================================
+   v8 — POLA PENDING BPJS & iDRG, dipelajari dari data klaim RS sendiri
+   ----------------------------------------------------------------------
+   PENDING_*: { periode, jumlah_klaim, jumlah_pending, alasan: [teks...],
+                kunci: [[tipe, kode, "RI"/"RJ", jml klaim, jml pending, [[idxAlasan, jml], ...]]] }
+     tipe C = kode INA-CBG, D = diagnosis utama, X = diagnosis mana pun, P = tindakan.
+   IDRG_*:    { jumlah, nbr: {RI, RJ}, drg: [[kode, deskripsi, mdc, deskripsi mdc, "RI"/"RJ", cost weight, tarif kls3, kls2, kls1]],
+                pola: [[dx efektif, tindakan penentu|"*", bucket dx sekunder|"*", "RI"/"RJ", kode DRG, jml]],
+                im: [[kode ICD-10, kode ICD-10-IM, jml]] }
+   Hanya ringkasan statistik — tidak ada data pasien yang disimpan.
+   ====================================================================== */
+let PENDING_RS = null, PENDING_ACUAN = null, IDRG_RS = null, IDRG_ACUAN = null;
+const PENDING_AMBANG = { minPending: 3, kuat: 0.2, perhatian: 0.1 };   // hasil uji mundur Mei–Agustus 2026
+const IDRG_PX_RUTIN = new Set(["99.18", "90.59", "89.52", "99.04", "57.94", "88.78", "93.57", "87.44", "87.49", "90.43", "90.44", "90.49", "91.39", "88.72", "89.7", "96.7", "93.96", "99.29", "99.21", "99.23", "90.52", "90.29", "89.65", "88.19", "38.93", "99.15", "99.07", "96.6"]);
+
+function _bulanDari(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (typeof v === "number") { const d = new Date(Math.round((v - 25569) * 86400000)); return isNaN(d) ? "" : d.toISOString().slice(0, 7); }
+  if (v instanceof Date) return isNaN(v) ? "" : v.toISOString().slice(0, 7);
+  const t = String(v).trim();
+  let m = t.match(/^(\d{4})-(\d{2})/); if (m) return `${m[1]}-${m[2]}`;
+  m = t.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})/); if (m) return `${m[3]}-${m[2].padStart(2, "0")}`;
+  return "";
+}
+// Kode ICD-9-CM di ekspor Excel sering berubah jadi jam ("90.59" → 90:59:00) — dikembalikan ke kode.
+function _kodeProsedur(v) {
+  if (v === null || v === undefined) return [];
+  const dariMenit = (mnt) => `${String(Math.floor(mnt / 60)).padStart(2, "0")}.${String(mnt % 60).padStart(2, "0")}`;
+  if (typeof v === "number") {
+    if (v <= 0) return [];
+    const mnt = v * 1440;
+    if (v < 5 && Math.abs(mnt - Math.round(mnt)) < 1e-6) return [dariMenit(Math.round(mnt))];
+    const t = String(v); return [/^\d\./.test(t) ? "0" + t : t];
+  }
+  const t = String(v).trim();
+  if (!t || t === "-") return [];
+  let m = t.match(/^(\d+) days?, (\d+):(\d\d)(:\d\d)?$/); if (m) return [dariMenit((Number(m[1]) * 24 + Number(m[2])) * 60 + Number(m[3]))];
+  m = t.match(/^(\d+):(\d\d)(:\d\d)?$/); if (m) return [dariMenit(Number(m[1]) * 60 + Number(m[2]))];
+  if (/^0\.\d{6,}$/.test(t)) return _kodeProsedur(Number(t));
+  return t.split(";").map((x) => x.trim()).filter((x) => x && x !== "-");
+}
+function _kunciKolom(r, ...nama) { const k = Object.keys(r).find((x) => nama.includes(String(x).trim().toLowerCase().replace(/[\s.]+/g, "_"))); return k === undefined ? undefined : r[k]; }
+function normalBarisEklaim(r) {
+  const k = (...n) => _kunciKolom(r, ...n);
+  const dx = String(k("diaglist") ?? "").split(";").map((x) => x.trim().toUpperCase()).filter((x) => x && x !== "-");
+  const kode = String(k("inacbg") ?? "").trim().toUpperCase();
+  const ptdRaw = String(k("ptd") ?? "").trim();
+  const ptd = ptdRaw === "1" ? "RI" : ptdRaw === "2" ? "RJ" : (/^[A-Z]-[146]-/.test(kode) ? "RI" : "RJ");
+  const angka = (x) => Number(String(x ?? "").replace(/[^\d.]/g, "")) || 0;
+  const drg = String(k("idrg_drg_code") ?? "").trim();
+  return {
+    dx, px: _kodeProsedur(k("proclist")), kode, ptd,
+    sep: String(k("sep", "nosep", "no_sep") ?? "").trim(), bulan: _bulanDari(k("discharge_date", "tglplg", "tgl_pulang")),
+    kelas: Number(String(k("kelas_rawat") ?? "3").trim()) || 3,
+    idrg: drg && drg !== "-" ? { drg, desk: String(k("idrg_drg_description") ?? "").trim(), mdc: String(k("idrg_mdc_number") ?? "").trim(), mdcDesk: String(k("idrg_mdc_description") ?? "").trim(),
+      tarif: angka(k("idrg_total_tarif")), nbr: angka(k("idrg_nbr")), il: String(k("idrg_diag_lists") ?? "").trim() } : null,
+  };
+}
+function bersihAlasanPending(t) {
+  let x = String(t ?? "");
+  const ta = typeof document !== "undefined" && document.createElement ? document.createElement("textarea") : null;
+  for (let i = 0; i < 3; i++) { if (ta) { ta.innerHTML = x; x = ta.value; } else x = x.replace(/&amp;/g, "&").replace(/&gt;/g, ">").replace(/&lt;/g, "<"); }
+  x = x.replace(/\[(KOREKSI VERIFIKASI|CONSOLE ALGORITMA)\]\s*-\s*/gi, "").replace(/^\s*\d{1,3}\.\s*/, "").replace(/\b\d{6,}\b/g, "#").replace(/\s+/g, " ").replace(/^[\s\-;]+|[\s\-;]+$/g, "");
+  return x.slice(0, 180);
+}
+function _kunciPending(c) {
+  const k = [];
+  if (c.kode) k.push(`C|${c.kode}|${c.ptd}`);
+  if (c.dx[0]) k.push(`D|${c.dx[0]}|${c.ptd}`);
+  [...new Set(c.dx)].forEach((x) => k.push(`X|${x}|${c.ptd}`));
+  [...new Set(c.px)].filter((x) => !IDRG_PX_RUTIN.has(x)).forEach((x) => k.push(`P|${x}|${c.ptd}`));   // tindakan rutin (infus, lab, EKG...) tidak informatif
+  return k;
+}
+// norm: baris e-Klaim ternormalisasi; pendingRows: baris rekap pending BPJS (kolom NOSEP + ALASANPENDING)
+function bangunPolaPending(norm, pendingRows) {
+  const alasanSEP = {};
+  pendingRows.forEach((r) => {
+    const sep = String(_kunciKolom(r, "nosep", "sep", "no_sep") ?? "").trim();
+    const al = bersihAlasanPending(_kunciKolom(r, "alasanpending", "alasan_pending", "alasan"));
+    if (/^\d{4}R\d/.test(sep)) alasanSEP[sep] = al || "(alasan tidak tercatat)";
+  });
+  const bulanP = new Set(norm.filter((c) => alasanSEP[c.sep] && c.bulan).map((c) => c.bulan));
+  const dasar = norm.filter((c) => c.bulan && bulanP.has(c.bulan) && c.dx.length);
+  const tab = {}; const teksGrup = {};
+  let jp = 0;
+  dasar.forEach((c) => {
+    const al = alasanSEP[c.sep];
+    let g = null;
+    if (al) { jp += 1; g = al.toLowerCase().replace(/(^|[^a-z0-9.])\d{1,2}(?=$|[^a-z0-9.])/g, "$1").replace(/[^a-z0-9]/g, "") || "x"; teksGrup[g] = teksGrup[g] || {}; teksGrup[g][al] = (teksGrup[g][al] || 0) + 1; }
+    _kunciPending(c).forEach((k) => { const t = (tab[k] = tab[k] || { n: 0, p: 0, a: {} }); t.n += 1; if (g) { t.p += 1; t.a[g] = (t.a[g] || 0) + 1; } });
+  });
+  const daftarAlasan = []; const idxGrup = {};
+  const idxDari = (g) => { if (idxGrup[g] === undefined) { idxGrup[g] = daftarAlasan.length; daftarAlasan.push(Object.entries(teksGrup[g]).sort((a, b) => b[1] - a[1])[0][0]); } return idxGrup[g]; };
+  const kunci = Object.entries(tab).filter(([, t]) => t.p >= 2).map(([k, t]) => {
+    const [tipe, kode, rirj] = k.split("|");
+    const al = Object.entries(t.a).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([g, j]) => [idxDari(g), j]);
+    return [tipe, kode, rirj, t.n, t.p, al];
+  }).sort((a, b) => b[4] - a[4]);
+  const bln = [...bulanP].sort();
+  return { periode: bln.length ? `${bln[0]} s/d ${bln[bln.length - 1]}` : "", jumlah_klaim: dasar.length, jumlah_pending: jp, sep_pending: Object.keys(alasanSEP).length, alasan: daftarAlasan, kunci };
+}
+function _dxEfektif(dx) {
+  if (dx.length > 1 && /^Z/.test(dx[0])) { const x = dx.slice(1).find((d) => !/^Z/.test(d)); if (x) return x; }
+  return dx[0] || "";
+}
+function _pxPenentu(px) { const s = px.filter((p) => !IDRG_PX_RUTIN.has(p)).sort(); return s[0] || (px.length ? "Y" : "N"); }
+function _bucketSek(dx) { const n = new Set(dx.slice(1)).size; return n === 0 ? "0" : n === 1 ? "1" : "2+"; }
+function bangunIdrg(norm) {
+  const rows = norm.filter((c) => c.idrg && c.dx.length);
+  if (!rows.length) return null;
+  const median = (a) => { if (!a.length) return 0; const b = [...a].sort((x, y) => x - y); const m = Math.floor(b.length / 2); return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
+  const drg = {}; const nbr = { RI: {}, RJ: {} }; const pola = {}; const im = {};
+  rows.forEach((c) => {
+    const g = c.idrg;
+    const d = (drg[g.drg] = drg[g.drg] || { desk: g.desk, mdc: g.mdc, mdcDesk: g.mdcDesk, jenis: {}, cw: [], t: { 1: [], 2: [], 3: [] } });
+    d.jenis[c.ptd] = (d.jenis[c.ptd] || 0) + 1;
+    if (g.tarif > 0 && g.nbr > 0) { d.cw.push(Math.round((g.tarif / g.nbr) * 10000) / 10000); nbr[c.ptd][g.nbr] = (nbr[c.ptd][g.nbr] || 0) + 1; }
+    if (g.tarif > 0) d.t[c.kelas] && d.t[c.kelas].push(g.tarif);
+    const de = _dxEfektif(c.dx), sg = _pxPenentu(c.px), b = _bucketSek(c.dx);
+    [`${de}|${sg}|${b}|${c.ptd}`, `${de}|${sg}|*|${c.ptd}`, `${de}|*|*|${c.ptd}`].forEach((k) => { pola[k] = pola[k] || {}; pola[k][g.drg] = (pola[k][g.drg] || 0) + 1; });
+    if (g.il && g.il !== "1") {
+      const B = g.il.split(";").map((x) => x.trim().toUpperCase());
+      if (B.length === c.dx.length) c.dx.forEach((x, i) => { im[x] = im[x] || {}; im[x][B[i]] = (im[x][B[i]] || 0) + 1; });
+    }
+  });
+  const modus = (o) => { const e = Object.entries(o).sort((a, b) => b[1] - a[1])[0]; return e ? Number(e[0]) : 0; };
+  return {
+    jumlah: rows.length,
+    nbr: { RI: modus(nbr.RI), RJ: modus(nbr.RJ) },
+    drg: Object.entries(drg).map(([k, d]) => [k, d.desk, d.mdc, d.mdcDesk, (d.jenis.RI || 0) >= (d.jenis.RJ || 0) ? "RI" : "RJ", median(d.cw), Math.round(median(d.t[3])), Math.round(median(d.t[2])), Math.round(median(d.t[1]))]),
+    pola: Object.entries(pola).map(([k, c]) => { const [kode, n] = Object.entries(c).sort((a, b) => b[1] - a[1])[0]; return n >= 3 ? [...k.split("|"), kode, n] : null; }).filter(Boolean),
+    im: Object.entries(im).map(([x, c]) => { const tot = Object.values(c).reduce((a, b) => a + b, 0); const [y, n] = Object.entries(c).sort((a, b) => b[1] - a[1])[0]; return y !== x && n >= 3 && n / tot >= 0.8 ? [x, y, n] : null; }).filter(Boolean),
+  };
+}
+
+// ---- pencarian (indeks dibuat sekali per sumber data)
+function _indeks(obj, nama, fn) { if (!obj) return null; if (!obj[nama]) Object.defineProperty(obj, nama, { value: fn(obj), enumerable: false }); return obj[nama]; }
+function presedenPending(claim) {
+  const sumber = PENDING_RS && PENDING_RS.kunci && PENDING_RS.kunci.length ? { d: PENDING_RS, acuan: false } : (PENDING_ACUAN && PENDING_ACUAN.kunci && PENDING_ACUAN.kunci.length ? { d: PENDING_ACUAN, acuan: true } : null);
+  if (!sumber) return null;
+  const idx = _indeks(sumber.d, "_idx", (d) => { const m = new Map(); d.kunci.forEach((r) => m.set(`${r[0]}|${r[1]}|${r[2]}`, r)); return m; });
+  const rirj = claim.jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
+  const dx = [claim.primaryDxCode, ...(claim.secondaryDx || []).map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean);
+  const px = (claim.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean);
+  const c = { kode: String(claim.inacbgCode || "").trim().toUpperCase(), dx, px, ptd: rirj };
+  const hits = [...new Set(_kunciPending(c))].map((k) => idx.get(k)).filter(Boolean).map((r) => ({
+    tipe: r[0], kode: r[1], rirj: r[2], n: r[3], p: r[4], rate: r[4] / r[3], alasan: (r[5] || []).map(([i, j]) => [sumber.d.alasan[i] || "", j]),
+  })).filter((h, _i, arr) => !(h.tipe === "X" && arr.some((o) => o.tipe === "D" && o.kode === h.kode))).sort((a, b) => b.rate - a.rate || b.p - a.p);
+  return hits.length ? { acuan: sumber.acuan, periode: sumber.d.periode || "", hits } : null;
+}
+function labelKunciPending(h) {
+  return h.tipe === "C" ? `kode INA-CBG ${h.kode}` : h.tipe === "D" ? `diagnosis utama ${h.kode} (${h.rirj})` : h.tipe === "X" ? `diagnosis ${h.kode} (${h.rirj})` : `tindakan ${h.kode} (${h.rirj})`;
+}
+function teksPresedenPending(hits, acuan, periode, maks = 2) {
+  return hits.slice(0, maks).map((h) => `${labelKunciPending(h)}: ${h.p} dari ${h.n} klaim dipending (${Math.round(h.rate * 100)}%)${h.alasan.length ? ` — alasan verifikator tersering: ${h.alasan.map(([t, j]) => `"${t}" (${j}x)`).join("; ")}` : ""}`).join(" | ")
+    + `. Sumber: ${acuan ? "pola pending acuan RS rujukan" : "rekap pending BPJS RS ini"}${periode ? " " + periode : ""}. Antisipasi: pastikan resume/penunjang menjawab alasan tersebut sebelum klaim diajukan.`;
+}
+function perkiraanIdrg(dx, px, rirj, kelas) {
+  const sumber = IDRG_RS && IDRG_RS.pola && IDRG_RS.pola.length ? { d: IDRG_RS, acuan: false } : (IDRG_ACUAN && IDRG_ACUAN.pola && IDRG_ACUAN.pola.length ? { d: IDRG_ACUAN, acuan: true } : null);
+  if (!sumber || !dx.length) return null;
+  const pola = _indeks(sumber.d, "_pola", (d) => { const m = new Map(); d.pola.forEach((r) => m.set(`${r[0]}|${r[1]}|${r[2]}|${r[3]}`, r)); return m; });
+  const drg = _indeks(sumber.d, "_drg", (d) => { const m = new Map(); d.drg.forEach((r) => m.set(r[0], r)); return m; });
+  const de = _dxEfektif(dx), sg = _pxPenentu(px), b = _bucketSek(dx);
+  const hit = pola.get(`${de}|${sg}|${b}|${rirj}`) || pola.get(`${de}|${sg}|*|${rirj}`) || pola.get(`${de}|*|*|${rirj}`);
+  if (!hit) return null;
+  const d = drg.get(hit[4]) || [hit[4], "", "", "", rirj, 0, 0, 0, 0];
+  const k = String(kelas || "3");
+  const tarif = rirj === "RJ" ? d[6] : (k === "1" ? d[8] : k === "2" ? d[7] : d[6]) || d[6];
+  const nbr = sumber.d.nbr ? sumber.d.nbr[rirj] : 0;
+  return { kode: d[0], deskripsi: d[1], mdc: d[2], mdcDesk: d[3], cw: d[5], tarif: sumber.acuan ? 0 : (tarif || (nbr && d[5] ? Math.round(nbr * d[5]) : 0)), jml: hit[5], acuan: sumber.acuan, dxEfektif: de, tingkat: hit[1] === "*" ? 3 : hit[2] === "*" ? 2 : 1 };
+}
+function kodeIcd10Im(kode) {
+  const src = (IDRG_RS && IDRG_RS.im && IDRG_RS.im.length ? IDRG_RS : IDRG_ACUAN);
+  if (!src || !src.im) return null;
+  const m = _indeks(src, "_im", (d) => { const x = new Map(); d.im.forEach((r) => x.set(r[0], r[1])); return x; });
+  return m.get(String(kode || "").trim().toUpperCase()) || null;
+}
+
 // DAFTAR_POLA_PENDING_RS_INI: kini disimpan per RS di database (diisi lewat Admin RS) dan disisipkan ke instruksi AI di server.
 
 
@@ -5909,6 +6094,7 @@ const DEFAULT_WEIGHTS = {
   kondisiAkutBukanDU: 2,
   rawatInapSatuHari: 3,
   persalinanTanpaZ37: 1,
+  polaPendingRS: 2,
 };
 
 const RULE_LABELS = {
@@ -5953,6 +6139,7 @@ const RULE_LABELS = {
   kondisiAkutBukanDU: "Kondisi akut/gawat dikode sekunder, bukan diagnosis utama",
   rawatInapSatuHari: "Rawat inap 1 hari / <6 jam — rawan dikoreksi jadi rawat jalan",
   persalinanTanpaZ37: "Persalinan tanpa kode luaran persalinan (Z37.-)",
+  polaPendingRS: "Klaim serupa sering dipending BPJS di RS ini (≥20% dari riwayat pending)",
 };
 
 // ============================================================================
@@ -5980,6 +6167,7 @@ const RULE_STAGE = {
   dxTidakDidukungLab: "medis", tipeDMTidakKonsisten: "kode", hipokalemiaRawanDihapus: "medis",
   inkonsistensiTanggal: "administrasi", inkonsistensiDiagnosis: "kode", inkonsistensiDokumenAI: "administrasi",
   ettBagianRJP: "kode", kodeA499Gabung: "kode", pebTidakMemenuhi: "medis", kondisiAkutBukanDU: "kode", rawatInapSatuHari: "administrasi", persalinanTanpaZ37: "kode",
+  polaPendingRS: "pola",
 };
 
 const STORAGE_KEY = "inacbg-screening-claims";
@@ -6398,6 +6586,7 @@ const RULE_ASPEK = {
   kodeA499Gabung: ["Koding", "Pakai kode fokus infeksi yang spesifik; pastikan leukosit/CRP mendukung infeksi bakteri", "DPJP"],
   pebTidakMemenuhi: ["Penunjang", "Cantumkan TD & protein urin; bila tidak memenuhi kriteria → O13", "DPJP"],
   kondisiAkutBukanDU: ["Koding", "Jadikan kondisi akut sebagai DU, atau hapus bila kriterianya tidak terpenuhi", "Casemix"],
+  polaPendingRS: ["Koding", "Cek dokumentasi terhadap alasan pending tersering untuk kode/diagnosis ini sebelum diajukan", "Casemix"],
   rawatInapSatuHari: ["Layanan", "Pastikan visit DPJP spesialis & indikasi rawat inap, atau ajukan sebagai rawat jalan", "DPJP"],
   persalinanTanpaZ37: ["Koding", "Tambahkan kode luaran persalinan Z37.-", "Casemix"],
 };
@@ -7018,6 +7207,14 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   notes.push(...sepCompletenessCheck(claim));
   const kodeTL = cekKodeVsRiwayat(claim);
   if (kodeTL) notes.push({ id: "kodeTidakLazimDx", label: "Kode INA-CBG tidak lazim untuk diagnosis utama ini", detail: `${kodeTL.ringkas} Periksa kembali pemilihan diagnosis utama/prosedur di e-Klaim sebelum diajukan.` });
+  // v8: preseden pending BPJS — RS sendiri menambah skor; pola acuan RS lain hanya catatan
+  const ppd = presedenPending(claim);
+  if (ppd) {
+    const kuat = ppd.hits.filter((h) => h.p >= PENDING_AMBANG.minPending && h.rate >= PENDING_AMBANG.kuat);
+    const perhatian = ppd.hits.filter((h) => h.p >= PENDING_AMBANG.minPending && h.rate >= PENDING_AMBANG.perhatian);
+    if (kuat.length && !ppd.acuan) add("polaPendingRS", teksPresedenPending(kuat, false, ppd.periode));
+    else if ((ppd.acuan ? kuat : perhatian).length) notes.push({ id: "polaPendingCatatan", label: ppd.acuan ? "Pola pending acuan: klaim serupa sering dipending" : "Klaim serupa pernah dipending BPJS di RS ini (10–20%)", detail: teksPresedenPending(ppd.acuan ? kuat : perhatian, ppd.acuan, ppd.periode) });
+  }
 
   // 1. Severity tinggi tanpa dx sekunder pendukung — hanya relevan utk rawat inap
   //    (rawat jalan umumnya tidak punya gradasi severity, kode INACBG-nya berakhiran -0)
@@ -7457,6 +7654,22 @@ async function analyzeClinicalText(clinicalText, jenisKasus, jenisRawat) {
 
 
 
+// v8: preseden pending BPJS & perkiraan iDRG sebagai bahan telaah AI (tetap tunduk aturan anti-upcoding)
+function konteksPendingIdrgAI(claim) {
+  let t = "";
+  const pp = presedenPending(claim);
+  const relevan = pp ? pp.hits.filter((h) => h.p >= 2 && h.rate >= 0.05).slice(0, 3) : [];
+  if (relevan.length) t += `\n- Preseden pending BPJS ${pp.acuan ? "(pola acuan RS rujukan)" : "di RS ini"}${pp.periode ? " " + pp.periode : ""} untuk klaim serupa: ${relevan.map((h) => `${labelKunciPending(h)} — ${h.p}/${h.n} klaim dipending (${Math.round(h.rate * 100)}%); alasan verifikator: ${h.alasan.map(([x, j]) => `"${x}" (${j}x)`).join("; ")}`).join(" | ")}. GUNAKAN untuk memeriksa apakah dokumentasi klaim ini sudah menjawab alasan-alasan tersebut dan sebutkan di "Area yang Perlu Diverifikasi" bila belum — BUKAN alasan menaikkan/menurunkan kode tanpa bukti tertulis.`;
+  const dx = [claim.primaryDxCode, ...(claim.secondaryDx || []).map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean);
+  const rirj = claim.jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
+  const ig = perkiraanIdrg(dx, (claim.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean), rirj, claim.kelasRawat);
+  const im = dx.map((x) => [x, kodeIcd10Im(x)]).filter(([, y]) => y);
+  if (ig) t += `\n- Perkiraan iDRG (pola grouper iDRG ${ig.acuan ? "acuan" : "RS ini"}, ${ig.jml}x preseden; simulasi transisi, BUKAN dasar klaim saat ini): ${ig.kode} "${ig.deskripsi}" (MDC ${ig.mdc}${ig.mdcDesk ? " " + ig.mdcDesk : ""}), cost weight ${ig.cw}${ig.tarif ? `, simulasi tarif Rp${Number(ig.tarif).toLocaleString("id-ID")}` : ""}${ig.dxEfektif !== dx[0] ? `; iDRG mengelompokkan berdasarkan kondisi ${ig.dxEfektif}, bukan kode Z ${dx[0]}` : ""}.`;
+  if (im.length) t += `\n- Kode ICD-10-IM (iDRG) lebih spesifik untuk: ${im.map(([x, y]) => `${x} → ${y}`).join(", ")}.`;
+  if (ig || im.length) t += ` Bila relevan, tambahkan satu kalimat kesiapan iDRG (spesifisitas kode ICD-10-IM/ICD-9-CM-IM & dokumentasi yang diperlukan) di bagian rekomendasi.`;
+  return t;
+}
+
 // Tarif resmi dari tabel tarif RS yang login, untuk kode INA-CBG + kelas rawat.
 // Rawat jalan hanya punya satu tarif. null = kode tidak ada / tarif tidak tersedia.
 function tarifResmiUntuk(kode, kelas) {
@@ -7561,7 +7774,7 @@ ${kodeKosong && riwayatRS && riwayatRS[7] === "acuan" ? `- Pola grouping acuan s
 - Skor aturan administratif otomatis (BUKAN penilaian klinis): ${claim.score} (${claim.riskLevel})
 - Penanda skrining otomatis yang terpicu: ${(claim.flags || []).map((f) => f.label).join("; ") || "tidak ada"}
 - Riwayat episode lain pasien ini di sistem (No. RM sama): ${riwayatEpisodeLain || "tidak ada"}
-- Temuan CDI otomatis (kode yang mungkin terlewat — tetap verifikasi ke data tertulis): ${temuanCDI || "tidak ada"}`;
+- Temuan CDI otomatis (kode yang mungkin terlewat — tetap verifikasi ke data tertulis): ${temuanCDI || "tidak ada"}${konteksPendingIdrgAI(claim)}`;
 
   let text = await aiTeks({ tugas: "analisis_klaim", varian: kodeKosong ? "kode_kosong" : "normal", dataKlaim: claimData }, 8000);
   if (!text) {
@@ -9301,6 +9514,23 @@ function LembarKodingEklaim({ claim }) {
             </div>
           ) : <p className="text-xs text-[#94A3AC]">Belum ada preseden untuk {v.du.code || "diagnosis ini"} — jalankan grouper e-Klaim.</p>}
         </div>
+        {(() => {
+          const dxV = [v.du.code, ...v.sek.map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean);
+          const rirjV = claim.jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
+          const ig = perkiraanIdrg(dxV, v.pr.map((p) => String(p.code || "").trim()).filter(Boolean), rirjV, claim.kelasRawat);
+          const im = dxV.map((x) => [x, kodeIcd10Im(x)]).filter(([, y]) => y);
+          if (!ig && !im.length) return null;
+          const tarifCbg = rw && rwTarif ? rwTarif : parseAngka(claim.tarifKlaim);
+          const selisih = ig && ig.tarif && tarifCbg ? Math.round(((ig.tarif - tarifCbg) / tarifCbg) * 1000) / 10 : null;
+          return (
+            <div className="border-t border-[#E2E8ED] pt-2">
+              <p className="text-[11px] text-[#94A3AC] mb-1">Perkiraan iDRG (simulasi kesiapan transisi — bukan dasar klaim saat ini)</p>
+              {ig && <ul><Baris it={{ code: ig.kode, desc: `${ig.deskripsi}${ig.mdc ? ` · MDC ${ig.mdc}` : ""} · CW ${String(ig.cw).replace(".", ",")}${ig.tarif ? ` · simulasi Rp${Number(ig.tarif).toLocaleString("id-ID")}` : ""}` }} /></ul>}
+              {ig && <p className="text-[10px] text-[#5B6B76]">{ig.jml}x preseden {ig.acuan ? "pada pola iDRG acuan" : "di data iDRG RS ini"}{ig.dxEfektif !== dxV[0] ? `; iDRG mengelompokkan menurut ${ig.dxEfektif} (bukan kode Z ${dxV[0]})` : ""}{selisih !== null ? ` · ${selisih >= 0 ? "+" : ""}${String(selisih).replace(".", ",")}% dibanding INA-CBG` : ""}.</p>}
+              {im.length > 0 && <p className="text-[11px] text-[#0B7285]">Kode ICD-10-IM (iDRG) lebih spesifik: {im.map(([x, y]) => `${x} → ${y}`).join(", ")}</p>}
+            </div>
+          );
+        })()}
         {claim.inacbgCode && versi === "klaim" && <p className="text-[11px] text-[#5B6B76]">Hasil grouping tercatat: <b className="font-mono">{claim.inacbgCode}</b>{parseAngka(claim.tarifKlaim) ? ` · Rp${parseAngka(claim.tarifKlaim).toLocaleString("id-ID")}` : ""}</p>}
         <div className="flex flex-wrap gap-1.5 pt-1">
           <button type="button" className={tombol} onClick={() => salin(teksLembar(), "lembar")}>{tersalin === "lembar" ? "Tersalin ✓" : "Salin lembar koding"}</button>
@@ -10999,8 +11229,21 @@ function bangunRiwayatDariEklaim(rows) {
   return { diagnosis, presisi, dxSekunder, jumlah: n };
 }
 
+async function bacaSemuaBaris(files, syarat) {
+  const out = [];
+  for (const f of files) {
+    const buf = await f.arrayBuffer();
+    const wb = /\.(txt|csv)$/i.test(f.name) ? XLSX.read(new TextDecoder().decode(buf), { type: "string" }) : XLSX.read(buf, { type: "array" });
+    wb.SheetNames.forEach((nm) => {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[nm], { defval: "" });
+      if (rows.length && syarat(rows[0])) rows.forEach((r) => out.push(r));
+    });
+  }
+  return out;
+}
 function PanelRiwayatGrouping() {
   const [file, setFile] = useState(null);
+  const [filePending, setFilePending] = useState(null);
   const [periode, setPeriode] = useState(RIWAYAT_INFO.periode || "");
   const [proses, setProses] = useState("");
   const [kabarEl, kabar] = useKabar();
@@ -11008,20 +11251,35 @@ function PanelRiwayatGrouping() {
     e.preventDefault();
     if (!file) { kabar(false, "Pilih file ekspor e-Klaim dulu."); return; }
     try {
-      setProses("Membaca file...");
-      const buf = await file.arrayBuffer();
-      const wb = /\.(txt|csv)$/i.test(file.name) ? XLSX.read(new TextDecoder().decode(buf), { type: "string" }) : XLSX.read(buf, { type: "array" });
-      const sheet = wb.SheetNames.find((x) => /^ina$/i.test(x)) || wb.SheetNames[0];
-      const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheet], { defval: "" });
+      setProses("Membaca file e-Klaim (file besar butuh ±1 menit)...");
+      const files = Array.from(file);
+      const rows = await bacaSemuaBaris(files, (r) => _kunciKolom(r, "diaglist") !== undefined && _kunciKolom(r, "inacbg") !== undefined);
+      if (!rows.length) throw new Error("Bukan file ekspor e-Klaim: kolom DIAGLIST dan INACBG tidak ditemukan.");
+      const norm = rows.map(normalBarisEklaim);
+      let pending = null; let pRows = [];
+      if (filePending && filePending.length) {
+        setProses("Membaca rekap pending BPJS...");
+        pRows = await bacaSemuaBaris(Array.from(filePending), (r) => _kunciKolom(r, "nosep", "sep", "no_sep") !== undefined && _kunciKolom(r, "alasanpending", "alasan_pending", "alasan") !== undefined);
+        if (!pRows.length) throw new Error("File pending tidak dikenali: perlu kolom NOSEP dan ALASANPENDING (format rekap pending BPJS).");
+        pending = bangunPolaPending(norm, pRows);
+        if (!pending.jumlah_pending) throw new Error("Tidak ada No. SEP pending yang cocok dengan file e-Klaim — pastikan periodenya sama.");
+      }
+      const sepPending = new Set();
+      pRows.forEach((r) => sepPending.add(String(_kunciKolom(r, "nosep", "sep", "no_sep") ?? "").trim()));
       setProses(`Mempelajari ${rows.length.toLocaleString("id-ID")} baris klaim...`);
-      const h = bangunRiwayatDariEklaim(rows);
+      const lolos = sepPending.size ? rows.filter((r, i) => !sepPending.has(norm[i].sep)) : rows;
+      const h = bangunRiwayatDariEklaim(lolos);
       if (!h.diagnosis.length) throw new Error("Data terlalu sedikit — belum ada kombinasi diagnosis yang muncul minimal 3x.");
+      const idrg = bangunIdrg(norm);
       setProses("Menyimpan...");
-      const { error } = await supabase.from("riwayat_rs").upsert({ rs_id: PROFIL.rs.id, diagnosis: h.diagnosis, presisi: h.presisi, dx_sekunder: h.dxSekunder, periode, jumlah_klaim: h.jumlah, sumber: file.name, diubah: new Date().toISOString() }, { onConflict: "rs_id" });
-      if (error) throw new Error(error.message);
+      const isi = { rs_id: PROFIL.rs.id, diagnosis: h.diagnosis, presisi: h.presisi, dx_sekunder: h.dxSekunder, periode, jumlah_klaim: h.jumlah, sumber: files.map((f) => f.name).join(", ").slice(0, 200), diubah: new Date().toISOString() };
+      if (pending) isi.pending = pending;
+      if (idrg) isi.idrg = idrg;
+      const { error } = await supabase.from("riwayat_rs").upsert(isi, { onConflict: "rs_id" });
+      if (error) throw new Error(/pending|idrg/.test(error.message) ? "Database belum diperbarui — jalankan SQL 09 dulu. (" + error.message + ")" : error.message);
       await muatRiwayatRS();
-      kabar(true, `Riwayat grouping diperbarui dari ${h.jumlah.toLocaleString("id-ID")} klaim: ${h.diagnosis.length} pola diagnosis, ${h.presisi.length} pola presisi, ${h.dxSekunder.length} pasangan diagnosis sekunder. Langsung dipakai untuk saran kode.`);
-      setFile(null);
+      kabar(true, `Diperbarui dari ${h.jumlah.toLocaleString("id-ID")} klaim${sepPending.size ? " lolos verifikasi" : ""}: ${h.diagnosis.length} pola diagnosis, ${h.presisi.length} pola presisi, ${h.dxSekunder.length} pasangan dx sekunder${pending ? `; pola pending dari ${pending.jumlah_pending.toLocaleString("id-ID")} klaim pending (${pending.kunci.length} pola)` : ""}${idrg ? `; iDRG dari ${idrg.jumlah.toLocaleString("id-ID")} klaim (${idrg.pola.length} pola)` : ""}. Langsung dipakai.`);
+      setFile(null); setFilePending(null);
     } catch (err) { kabar(false, err.message); }
     setProses("");
   };
@@ -11033,18 +11291,21 @@ function PanelRiwayatGrouping() {
         <button type="button" onClick={async () => {
           if (!window.confirm(`Jadikan riwayat grouping ${PROFIL.rs.nama} (${RIWAYAT_INFO.jumlah.toLocaleString("id-ID")} klaim) sebagai POLA ACUAN untuk semua RS? Yang dibagikan hanya pasangan diagnosis → kode INA-CBG + jumlah kejadian (tanpa data pasien & tanpa tarif).`)) return;
           const tanpaTarif = (arr, iTarif) => arr.filter((r) => r[r.length - 1] !== "acuan").map((r) => r.map((v, i) => (i === iTarif ? 0 : v)));
-          const { error } = await supabase.from("riwayat_acuan").upsert({ id: 1, diagnosis: tanpaTarif(DAFTAR_RIWAYAT_DIAGNOSIS_INACBG, 6), presisi: tanpaTarif(DAFTAR_RIWAYAT_PRESISI, 7), dx_sekunder: DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.filter((r) => r[5] !== "acuan"), periode: RIWAYAT_INFO.periode, jumlah_klaim: RIWAYAT_INFO.jumlah, sumber: PROFIL.rs.kode, diubah: new Date().toISOString() }, { onConflict: "id" });
+          const { error } = await supabase.from("riwayat_acuan").upsert({ id: 1, diagnosis: tanpaTarif(DAFTAR_RIWAYAT_DIAGNOSIS_INACBG, 6), presisi: tanpaTarif(DAFTAR_RIWAYAT_PRESISI, 7), dx_sekunder: DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.filter((r) => r[5] !== "acuan"), periode: RIWAYAT_INFO.periode, jumlah_klaim: RIWAYAT_INFO.jumlah, sumber: PROFIL.rs.kode, diubah: new Date().toISOString(),
+            ...(PENDING_RS ? { pending: PENDING_RS } : {}), ...(IDRG_RS ? { idrg: { ...IDRG_RS, nbr: null, drg: IDRG_RS.drg.map((r) => [...r.slice(0, 6), 0, 0, 0]) } } : {}) }, { onConflict: "id" });
           if (error) kabar(false, error.message); else { await muatRiwayatRS(); kabar(true, "Pola acuan diperbarui — langsung dipakai semua RS saat login berikutnya."); }
         }} className="mb-3 text-xs font-semibold text-[#0B7285] hover:underline">Jadikan riwayat RS ini pola acuan untuk semua RS (superadmin)</button>
       )}
-      <p className="text-sm text-[#334652] mb-3">Saat ini: {RIWAYAT_INFO.jumlah ? <b>{RIWAYAT_INFO.jumlah.toLocaleString("id-ID")} klaim{RIWAYAT_INFO.periode ? " · " + RIWAYAT_INFO.periode : ""}</b> : <b>belum ada data</b>} · {DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.length} pola diagnosis, {DAFTAR_RIWAYAT_PRESISI.length} pola presisi, {DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.length} pasangan dx sekunder</p>
+      <p className="text-sm text-[#334652] mb-1">Saat ini: {RIWAYAT_INFO.jumlah ? <b>{RIWAYAT_INFO.jumlah.toLocaleString("id-ID")} klaim{RIWAYAT_INFO.periode ? " · " + RIWAYAT_INFO.periode : ""}</b> : <b>belum ada data</b>} · {DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.length} pola diagnosis, {DAFTAR_RIWAYAT_PRESISI.length} pola presisi, {DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT.length} pasangan dx sekunder</p>
+      <p className="text-xs text-[#334652] mb-3">Pola pending BPJS: {PENDING_RS ? <b>{PENDING_RS.jumlah_pending.toLocaleString("id-ID")} klaim pending dari {PENDING_RS.jumlah_klaim.toLocaleString("id-ID")} klaim ({PENDING_RS.periode}) · {PENDING_RS.kunci.length} pola</b> : PENDING_ACUAN ? "memakai pola acuan (hanya catatan, tidak menambah skor)" : "belum ada"} · iDRG: {IDRG_RS ? <b>{IDRG_RS.jumlah.toLocaleString("id-ID")} klaim · {IDRG_RS.pola.length} pola · {IDRG_RS.im.length} kode ICD-10-IM</b> : IDRG_ACUAN ? "memakai pola acuan" : "belum ada"}</p>
       <form onSubmit={unggah} className="space-y-2">
         <div className="flex flex-wrap gap-2 items-end">
-          <div><label className="block text-xs text-[#5B6B76] mb-1">File ekspor klaim e-Klaim (TXT/Excel)</label><input type="file" accept=".xlsx,.xls,.csv,.txt" onChange={(e) => setFile(e.target.files[0] || null)} className="text-xs" /></div>
+          <div><label className="block text-xs text-[#5B6B76] mb-1">1. Ekspor klaim e-Klaim (wajib; boleh beberapa file/sheet per bulan)</label><input type="file" multiple accept=".xlsx,.xls,.csv,.txt" onChange={(e) => setFile(e.target.files && e.target.files.length ? e.target.files : null)} className="text-xs" /></div>
+          <div><label className="block text-xs text-[#5B6B76] mb-1">2. Rekap klaim pending BPJS (opsional; kolom NOSEP + ALASANPENDING)</label><input type="file" multiple accept=".xlsx,.xls,.csv" onChange={(e) => setFilePending(e.target.files && e.target.files.length ? e.target.files : null)} className="text-xs" /></div>
           <div className="flex-1 min-w-[180px]"><label className="block text-xs text-[#5B6B76] mb-1">Periode data</label><input value={periode} onChange={(e) => setPeriode(e.target.value)} placeholder="mis. Januari–September 2026" className={KELAS_INPUT} /></div>
           <button type="submit" disabled={!!proses} className={TOMBOL_UTAMA}>{proses ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />} {proses || "Pelajari & simpan"}</button>
         </div>
-        <p className="text-[11px] text-[#94A3AC]">Gunakan ekspor klaim e-Klaim beberapa bulan sekaligus (makin banyak makin akurat). Unggahan baru MENGGANTI riwayat sebelumnya — gabungkan periode lama + baru dalam satu file. Hanya pola yang muncul minimal 3x yang dipakai; data pasien tidak disimpan, hanya ringkasan statistiknya.</p>
+        <p className="text-[11px] text-[#94A3AC]">Gunakan ekspor klaim e-Klaim beberapa bulan sekaligus (makin banyak makin akurat; kolom iDRG ikut dipelajari bila ada). Bila rekap pending BPJS ikut diunggah, saran kode hanya belajar dari klaim yang LOLOS verifikasi, dan pola pending (kode/diagnosis/tindakan yang sering dipending + alasan verifikator) dipakai untuk skrining & opini AI. Unggahan baru MENGGANTI data sebelumnya — unggah periode lama + baru bersamaan. Hanya pola yang muncul minimal 3x yang dipakai; data pasien tidak disimpan, hanya ringkasan statistiknya.</p>
       </form>
     </Section>
   );
