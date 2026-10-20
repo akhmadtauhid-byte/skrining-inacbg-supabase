@@ -6250,6 +6250,8 @@ const DEFAULT_WEIGHTS = {
   persalinanTanpaZ37: 1,
   polaPendingRS: 2,
   kodeBedaPrediksi: 2,
+  terapiTidakTercatat: 2,
+  pneumoniaKurang72Jam: 3,
 };
 
 const RULE_LABELS = {
@@ -6296,6 +6298,8 @@ const RULE_LABELS = {
   persalinanTanpaZ37: "Persalinan tanpa kode luaran persalinan (Z37.-)",
   polaPendingRS: "Klaim serupa sering dipending BPJS di RS ini (≥20% dari riwayat pending)",
   kodeBedaPrediksi: "Kode INA-CBG/severity berbeda dari prediksi model grouper RS (dari diagnosis & tindakan yang diinput)",
+  terapiTidakTercatat: "Diagnosis dikode tetapi terapi pendukungnya tidak tercatat di resume (rawan dihapus/dikoreksi)",
+  pneumoniaKurang72Jam: "Pneumonia sebagai diagnosis utama dengan rawat < 4 hari (antibiotik injeksi < 72 jam → R91)",
 };
 
 // ============================================================================
@@ -6325,6 +6329,8 @@ const RULE_STAGE = {
   ettBagianRJP: "kode", kodeA499Gabung: "kode", pebTidakMemenuhi: "medis", kondisiAkutBukanDU: "kode", rawatInapSatuHari: "administrasi", persalinanTanpaZ37: "kode",
   polaPendingRS: "pola",
   kodeBedaPrediksi: "kode",
+  terapiTidakTercatat: "medis",
+  pneumoniaKurang72Jam: "medis",
 };
 
 const STORAGE_KEY = "inacbg-screening-claims";
@@ -6745,6 +6751,8 @@ const RULE_ASPEK = {
   kondisiAkutBukanDU: ["Koding", "Jadikan kondisi akut sebagai DU, atau hapus bila kriterianya tidak terpenuhi", "Casemix"],
   polaPendingRS: ["Koding", "Cek dokumentasi terhadap alasan pending tersering untuk kode/diagnosis ini sebelum diajukan", "Casemix"],
   kodeBedaPrediksi: ["Koding", "Cocokkan diagnosis/tindakan yang diinput di e-Klaim dengan kode hasil grouping; cek CC yang terlewat atau berlebih", "Casemix"],
+  terapiTidakTercatat: ["Terapi", "Lengkapi catatan terapi pendukung diagnosis di resume/CPPT, atau hapus diagnosis bila memang tidak ditatalaksana", "DPJP"],
+  pneumoniaKurang72Jam: ["Terapi", "Pastikan antibiotik injeksi ≥ 72 jam & foto toraks tercatat; bila tidak, diskusikan diagnosis utama dengan DPJP", "DPJP"],
   rawatInapSatuHari: ["Layanan", "Pastikan visit DPJP spesialis & indikasi rawat inap, atau ajukan sebagai rawat jalan", "DPJP"],
   persalinanTanpaZ37: ["Koding", "Tambahkan kode luaran persalinan Z37.-", "Casemix"],
 };
@@ -7173,6 +7181,68 @@ function ambilAngkaKlinis(teks, re) {
   return isNaN(v) ? null : { nilai: v, kurangDari: /</.test(m[0]), kutipan: m[0].trim() };
 }
 const OBAT_ANTIDIABETIK_ORAL = /metformin|glikazid|gliclazid|glicasid|gliklazid|glimepirid|glibenklamid|glikuidon|acarbose|akarbose|pioglitazon|sitagliptin|vildagliptin|linagliptin/i;
+
+// ---- v10: TERAPI PENDUKUNG DIAGNOSIS (bukan resep — hanya cek apakah terapi tercatat) ----
+const OBAT_RE = {
+  antibiotik: /ce(f|ph)tri?a?x?on|seftriakson|cefotaxim|sefotaksim|cefixim|sefiksim|cefoperazon|sefoperazon|ceftazidim|seftazidim|cefepim|sefepim|cefuroxim|sefuroksim|cefadroxil|sefadroksil|cefazolin|sefazolin|amo?xi?c?il+in|amoksisilin|amp[iy]c?il+in|ampisilin|sulbactam|amoxiclav|meropenem|imipenem|ertapenem|levofloxacin|levofloksasin|ciprofloxacin|siprofloksasin|moxifloxacin|azithromycin|azitromisin|clarithromycin|klaritromisin|erythromycin|eritromisin|gentamicin|gentamisin|amikacin|amikasin|metronidazol|clindamycin|klindamisin|cotrimoxazol|kotrimoksazol|chloramphenicol|kloramfenikol|thiamphenicol|tiamfenikol|doxycyclin|doksisiklin|vancomycin|vankomisin|piperacillin|tazobactam|fosfomycin|nitrofurantoin|antibiotik|antibiotic/i,
+  oat: /rifampi[cs]in|isoniazid|\bINH\b|pirazinamid|pyrazinamide|etambutol|ethambutol|\bOAT\b|\bFDC\b|streptomisin|streptomycin/i,
+  antidiabetik: /metformin|glikazid|gliclazid|glimepirid|glibenklamid|glikuidon|acarbose|akarbose|pioglitazon|sitagliptin|vildagliptin|linagliptin|insulin|novorapid|levemir|lantus|sansulin|apidra|humalog|actrapid|novomix|ryzodeg|glargin|aspart|lispro|detemir/i,
+  antihipertensi: /amlodipin|nifedipin|captopril|kaptopril|lisinopril|ramipril|enalapril|candesartan|kandesartan|valsartan|losartan|irbesartan|telmisartan|bisoprolol|propranolol|carvedilol|karvedilol|metoprolol|atenolol|clonidin|klonidin|diltiazem|nicardipin|perdipin|furosemid|hidroklorotiazid|\bHCT\b|spironolakton|spironolactone|metildopa|methyldopa|antihipertensi/i,
+  diuretik: /furosemid|furosemide|lasix|spironolakton|spironolactone|torasemid|torsemid|\bHCT\b|digoksin|digoxin|diuretik/i,
+  oksigen: /oksigen|oxygen|\bO2\b|nasal\s*kanul|nasal\s*canul|\bNRM\b|non\s*-?\s*rebreath|simple\s*mask|sungkup|ventilator|\bNIV\b|CPAP|BiPAP|HFNC|high\s*flow|intubasi|\bETT\b/i,
+  vasopresor: /norepinefrin|norepinephrine|\bNE\b|vascon|raivas|dopamin|dobutamin|epinefrin|epinephrine|adrenalin|vasopres|loading\s*cairan|resusitasi\s*cairan|guyur|bolus\s*cairan|fluid\s*challenge/i,
+  mgso4: /mg\s*so\s*4|magnesium\s*sulfat|magnesium\s*sulphate/i,
+  antikonvulsan: /diazepam|stesolid|fenitoin|phenytoin|kutoin|levetiracetam|keppra|valproat|valproic|depakene|fenobarbital|phenobarbital|luminal|midazolam|carbamazepin|karbamazepin/i,
+  gizi: /F-?75|F-?100|resomal|\bPMT\b|susu|formula|nutrisi|diet\s*(TKTP|tinggi)|konsul(tasi)?\s*gizi|ahli\s*gizi|enteral|sonde|ensure|peptamen|pediasure|kalori/i,
+  anemia: /transfusi|\bPRC\b|packed\s*red|whole\s*blood|\bWB\b|sulfas\s*fer|\bSF\b|ferro|ferrous|\bFe\b|iron|venofer|asam\s*folat|folic|eritropoietin|\bEPO\b|hemapo|recormon|vitamin\s*B\s*12|sianokobalamin/i,
+  natrium: /NaCl\s*3\s*%?|hipertonik|koreksi\s*(natrium|Na)\b|NaCl\s*(caps|kapsul|tab)|tablet\s*garam/i,
+  kalium: /\bKCl\b|kalium\s*klorida|\bKSR\b|aspar\s*-?\s*K|koreksi\s*(kalium|K)\b|drip\s*K/i,
+  rehidrasi: /\bRL\b|ringer|NaCl\s*0[,.]9|infus|IVFD|rehidrasi|oralit|cairan/i,
+};
+const TERAPI_PENDUKUNG = [
+  // [pola kode ICD-10, nama kondisi, kelompok terapi, contoh alasan pending nyata]
+  [/^E87\.6/, "hipokalemia", "kalium", "E87.6 → hapus, progres perbaikan setelah terapi (-)"],
+  [/^E87\.1/, "hiponatremia", "natrium", "hiponatremia (X), tidak mendapatkan tatalaksana koreksi elektrolit"],
+  [/^(D64\.9|D50|D62|D63)/, "anemia", "anemia", "DU D64.9 (tatalaksana ++)"],
+  [/^J1[2-8]/, "pneumonia", "antibiotik", "J18.0 → R91, terapi antibiotik < 72 jam"],
+  [/^A4[01]/, "sepsis", "antibiotik", "A41.9 → hapus, tatalaksana antibiotik (-)"],
+  [/^(A49|A09|A04|A01|A02|N39\.0|N30|N10|L03|K35|J02|J03|J20)/, "infeksi bakteri", "antibiotik", "A49.9 kode gabung pencernaan & bacterial infection (tatalaksana ++)"],
+  [/^A1[5-9]/, "tuberkulosis", "oat", "TB tanpa OAT tercatat"],
+  [/^E1[0-4]/, "diabetes melitus", "antidiabetik", "DM tanpa terapi antidiabetik tercatat"],
+  [/^I1[0-3]/, "hipertensi", "antihipertensi", "I13.2/I10: resume tidak ada hipertensi/terapinya"],
+  [/^I50/, "gagal jantung", "diuretik", "I50.0 sebagai DU/DS perlu klinis & tatalaksana"],
+  [/^J96/, "gagal napas", "oksigen", "gagal napas: tatalaksana lebih spesifik"],
+  [/^R57/, "syok", "vasopresor", "syok sebagai DU (klinis, lampiran & tatalaksana ++)"],
+  [/^O14\.[12]/, "preeklampsia berat/HELLP", "mgso4", "O14.1 → O14.0, terapi MgSO4 (-)"],
+  [/^E4[0-6]/, "malnutrisi", "gizi", "malnutrisi tanpa terapi gizi tercatat"],
+  [/^(G40|G41|R56)/, "kejang", "antikonvulsan", "kejang tanpa antikonvulsan tercatat"],
+  [/^E86/, "dehidrasi", "rehidrasi", "dehidrasi tanpa rehidrasi tercatat"],
+];
+const LABEL_TERAPI = { antibiotik: "antibiotik", oat: "OAT", antidiabetik: "antidiabetik (OAD/insulin)", antihipertensi: "antihipertensi", diuretik: "diuretik", oksigen: "terapi oksigen/ventilasi", vasopresor: "vasopresor/inotropik atau resusitasi cairan", mgso4: "MgSO4", antikonvulsan: "antikonvulsan", gizi: "terapi gizi (F75/F100/diet/konsul gizi)", anemia: "transfusi/PRC atau terapi besi/asam folat/EPO", natrium: "koreksi natrium (NaCl 3%/hipertonik)", kalium: "koreksi kalium (KCl/KSR)", rehidrasi: "rehidrasi (infus/oralit)" };
+function validasiTerapi(claim) {
+  const hasil = [];
+  const du = String(claim.primaryDxCode || "").trim().toUpperCase();
+  const sek = (claim.secondaryDx || []).map((d) => String(d.code || "").trim().toUpperCase()).filter(Boolean);
+  const rawatInap = claim.jenisRawat !== "Rawat Jalan";
+  // A. Pneumonia sebagai DU rawat < 4 hari — data RSUAM Jan–Agu 2026: 12 dari 12 klaim dipending (→ R91)
+  if (rawatInap && /^J1[2-8]/.test(du) && Number(claim.los) > 0 && Number(claim.los) < 4) {
+    hasil.push({ id: "pneumoniaKurang72Jam", detail: `Pneumonia ${du} sebagai diagnosis utama dengan lama rawat ${claim.los} hari. Pada data RS ini (Januari–Agustus 2026) 12 dari 12 klaim seperti ini dipending dan dikoreksi menjadi R91 — alasan verifikator: "pneumonia sebagai diagnosis utama < 4 hari, sesuai PNPK terapi injeksi antibiotik minimal 72 jam". Pastikan antibiotik injeksi ≥ 72 jam & foto toraks tercatat; bila tidak terpenuhi, diskusikan dengan DPJP apakah diagnosis utama lebih tepat dikode lain.` });
+  }
+  // B. Diagnosis yang dikode tetapi terapi pendukungnya tidak tercatat di resume
+  const teks = String(claim.resumeMedis || "");
+  const adaBagianTerapi = teks.length >= 120 && Object.values(OBAT_RE).some((re) => re.test(teks));
+  if (!adaBagianTerapi) return hasil;   // resume tidak memuat terapi sama sekali → tidak dinilai (hindari alarm palsu)
+  const kurang = [];
+  [du, ...sek].forEach((kode, i) => {
+    const r = TERAPI_PENDUKUNG.find(([re]) => re.test(kode));
+    if (!r || kurang.some((k) => k.kode === kode)) return;
+    if (!OBAT_RE[r[2]].test(teks)) kurang.push({ kode, kondisi: r[1], terapi: LABEL_TERAPI[r[2]], contoh: r[3], peran: i === 0 ? "diagnosis utama" : "diagnosis sekunder" });
+  });
+  if (kurang.length) {
+    hasil.push({ id: "terapiTidakTercatat", detail: kurang.map((k) => `${k.kode} (${k.kondisi}, ${k.peran}) dikode tetapi ${k.terapi} tidak tercatat di resume — contoh alasan pending nyata: "${k.contoh}"`).join("; ") + `. Verifikator BPJS menilai diagnosis dari klinis + penunjang + TATALAKSANA; tanpa terapi yang tercatat, diagnosis sekunder rawan dihapus (severity turun) dan diagnosis utama rawan dikoreksi. Lengkapi catatan terapi di resume/CPPT bila memang diberikan, atau konfirmasi ke DPJP. Ini pemeriksaan kelengkapan dokumentasi, BUKAN rekomendasi resep.` });
+  }
+  return hasil;
+}
 
 function validasiKlinisDeterministik(claim) {
   const hasil = [];
@@ -7643,6 +7713,8 @@ function computeFlags(claim, allClaims, byInacbg, w) {
 
   // 9k. Validasi klinis deterministik (angka lab vs diagnosis, konsistensi tipe DM)
   validasiKlinisDeterministik(claim).forEach((v) => add(v.id, v.detail));
+  // 9l. v10: kesesuaian diagnosis ↔ terapi yang tercatat (dari alasan pending nyata)
+  validasiTerapi(claim).forEach((v) => add(v.id, v.detail));
 
   // 9m. Aturan dari ALASAN PENDING NYATA Agustus 2026 (124 kasus, dicocokkan per SEP ke
   //     6.851 klaim e-Klaim Agustus). Angka "n/pending" di komentar = berapa klaim
@@ -10507,7 +10579,7 @@ function Settings({ weights, onChange, onReset, autoAI, onSetAutoAILevel }) {
             </div>
           ))}
         </div>
-        <p className="text-xs text-[#94A3AC] mt-4">Ambang risiko: skor 0 = Rendah, 1–3 = Sedang, ≥4 = Tinggi. Perubahan bobot langsung memengaruhi seluruh klaim di Dashboard.</p>
+        <p className="text-xs text-[#94A3AC] mt-4">Ambang risiko: skor 0–1 = Rendah, 2–4 = Sedang, ≥5 = Tinggi. Perubahan bobot langsung memengaruhi seluruh klaim di Dashboard.</p>
       </Section>
     </div>
   );
