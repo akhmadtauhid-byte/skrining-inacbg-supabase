@@ -5745,8 +5745,14 @@ function cekKodeVsRiwayat(claim) {
 // Cari kode INA-CBG dari riwayat klaim nyata RS ini berdasarkan kode diagnosis + ADA/TIDAKNYA
 // prosedur + kelas rawat. Fallback bertingkat: (1) kecocokan persis, (2) kelas rawat lain tapi
 // status prosedur SAMA (paling penting dijaga), (3) null jika benar2 tidak ada preseden.
-function findRiwayatInacbg(primaryDxCode, adaProsedur, kelasRawat) {
+// v17: kode INA-CBG digit ke-2 = jenis kasus (1/4/6 = rawat inap; 2/3/5/9 = rawat jalan)
+function jenisDariKodeInacbg(kode) { return /^[A-Z]-[146]-/.test(String(kode || "").trim().toUpperCase()) ? "RI" : "RJ"; }
+function jenisDariKlaim(c) { return c && c.jenisRawat === "Rawat Jalan" ? "RJ" : "RI"; }
+function findRiwayatInacbg(primaryDxCode, adaProsedur, kelasRawat, jenis) {
   if (!primaryDxCode) return null;
+  if (jenis) { const r = findRiwayatInacbg(primaryDxCode, adaProsedur, kelasRawat); if (r && jenisDariKodeInacbg(r[3]) === jenis) return r;
+    const kd = primaryDxCode.trim().toUpperCase(), pf = adaProsedur ? "Y" : "N";
+    return DAFTAR_RIWAYAT_DIAGNOSIS_INACBG.filter((x) => x[0] === kd && x[1] === pf && jenisDariKodeInacbg(x[3]) === jenis).sort((a, b) => (b[2] === (Number(kelasRawat) || 3)) - (a[2] === (Number(kelasRawat) || 3)) || b[5] - a[5])[0] || null; }
   const kode = primaryDxCode.trim().toUpperCase();
   const kelas = Number(kelasRawat) || 3;
   const prosedurFlag = adaProsedur ? "Y" : "N";
@@ -5785,8 +5791,19 @@ let DAFTAR_RIWAYAT_PRESISI = [];   // dimuat dari database per RS (lihat muatRiw
 // prosedur (paling menentukan tarif — lihat catatan di DAFTAR_RIWAYAT_DIAGNOSIS_INACBG),
 // jumlah diagnosis sekunder, DAN kelas rawat. Fallback bertingkat menjaga status ada-prosedur
 // tetap sama di tiap tingkat sebelum melonggarkan syarat lain.
-function findRiwayatInacbgPresisi(primaryDxCode, adaProsedur, jumlahDiagnosisSekunder, kelasRawat) {
+function findRiwayatInacbgPresisi(primaryDxCode, adaProsedur, jumlahDiagnosisSekunder, kelasRawat, jenis) {
   if (!primaryDxCode) return null;
+  if (jenis) {
+    const r = findRiwayatInacbgPresisi(primaryDxCode, adaProsedur, jumlahDiagnosisSekunder, kelasRawat);
+    if (r && jenisDariKodeInacbg(r.kode) === jenis) return r;
+    const kd = primaryDxCode.trim().toUpperCase(), pf = adaProsedur ? "Y" : "N", kl = Number(kelasRawat) || 3;
+    const bk = jumlahDiagnosisSekunder >= 2 ? "2+" : String(jumlahDiagnosisSekunder || 0);
+    const c = DAFTAR_RIWAYAT_PRESISI.filter((x) => x[0] === kd && x[1] === pf && jenisDariKodeInacbg(x[4]) === jenis)
+      .sort((a, b) => (b[2] === bk) - (a[2] === bk) || (b[3] === kl) - (a[3] === kl) || b[6] - a[6])[0];
+    if (c) return { ...arrToRiwayatPresisi(c), presisi: c[2] === bk };
+    const u = findRiwayatInacbg(primaryDxCode, adaProsedur, kelasRawat, jenis);
+    return u ? { dxUtama: u[0], adaProsedur: u[1], kelasRawat: u[2], kode: u[3], deskripsi: u[4], jml: u[5], tarifMedian: u[6], presisi: false, sumber: u[7] || "rs" } : null;
+  }
   const kode = primaryDxCode.trim().toUpperCase();
   const kelas = Number(kelasRawat) || 3;
   const prosedurFlag = adaProsedur ? "Y" : "N";
@@ -6229,13 +6246,13 @@ async function muatTarifRS() {
 // Resume Medis sebelum proses grouping e-Klaim selesai). Ini heuristik kata kunci
 // SEDERHANA (bukan grouper resmi) — hasilnya cuma kandidat pertimbangan utk AI,
 // bukan jawaban pasti.
-function findCandidateInacbgCodes(primaryDxDesc, maxResults) {
+function findCandidateInacbgCodes(primaryDxDesc, maxResults, jenis) {
   maxResults = maxResults || 6;
   if (!primaryDxDesc) return [];
   const stopWords = new Set(["unspecified", "the", "and", "of", "with", "without", "other", "due", "to", "in", "not", "specified", "acute", "chronic", "type", "syndrome", "disease", "disorder"]);
   const words = primaryDxDesc.toLowerCase().split(/[^a-z]+/).filter((w) => w.length >= 4 && !stopWords.has(w));
   if (words.length === 0) return [];
-  const scored = TARIF_REF_RAW.map((row) => {
+  const scored = TARIF_REF_RAW.filter((row) => !jenis || jenisDariKodeInacbg(row[0]) === jenis).map((row) => {
     const desc = row[1].toLowerCase();
     let score = 0;
     words.forEach((w) => { if (desc.indexOf(w) >= 0) score += 1; });
@@ -7537,6 +7554,16 @@ function screenAllClaims(claims, weights) {
     // kewajaran tarif antar-kelompok) TIDAK BISA dijalankan sama sekali. Karena
     // itu hasil "Rendah" pada kondisi ini menyesatkan — bukan berarti klaim aman,
     // tapi skriningnya memang belum bisa menilai. Tandai jelas sbg "Belum Lengkap".
+    // v18: pasien masih dalam pelayanan — aturan yang butuh data akhir ditunda (tidak dihitung)
+    let notesAkhir = base.notes;
+    if (dalamPerawatan(claim)) {
+      const ditunda = flags.filter((f) => ATURAN_TUNDA_DIRAWAT.has(f.id));
+      ditunda.forEach((f) => { score -= Number(f.weight) || 0; });
+      for (let i = flags.length - 1; i >= 0; i--) if (ATURAN_TUNDA_DIRAWAT.has(flags[i].id)) flags.splice(i, 1);
+      notesAkhir = [{ id: "dalamPerawatan", label: `Pasien masih dalam pelayanan${claim.asalMasuk ? ` (masuk dari ${claim.asalMasuk})` : ""} — hasil skrining sementara`,
+        detail: `Aturan yang memerlukan data akhir (lama rawat, kode & tarif INA-CBG final, tindakan dan terapi lengkap) belum dijalankan${ditunda.length ? ` — ${ditunda.length} temuan ditunda: ${ditunda.map((f) => f.label).join("; ")}` : ""}. Yang tetap dicek sejak awal: kelengkapan bukti diagnosis, riwayat kunjungan/readmisi, kriteria gawat darurat IGD, dan pola pending. Tekan "Pasien Pulang" di jendela ini setelah resume medis selesai untuk skrining lengkap.` },
+        ...(base.notes || []).filter((n) => !ATURAN_TUNDA_DIRAWAT.has(n.id))];
+    }
     const adaKodeInacbg = !!(claim.inacbgCode && String(claim.inacbgCode).trim());
     const adaTarif = parseAngka(claim.tarifKlaim) > 0;
     const dataIntiLengkap = adaKodeInacbg && adaTarif;
@@ -7555,7 +7582,7 @@ function screenAllClaims(claims, weights) {
     // Tahap "kode" tidak boleh dinyatakan lolos kalau kode/tarifnya memang belum ada
     if (!dataIntiLengkap && stages.kode === "lolos") stages.kode = "perlu_dicek";
 
-    return { ...claim, flags, score, riskLevel, dataIntiLengkap, notes: base.notes, stages };
+    return { ...claim, flags, score, riskLevel, dataIntiLengkap, notes: notesAkhir, stages };
   });
 }
 
@@ -7861,6 +7888,15 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   validasiKlinisDeterministik(claim).forEach((v) => add(v.id, v.detail));
   // 9l. v10: kesesuaian diagnosis ↔ terapi yang tercatat (dari alasan pending nyata)
   validasiTerapi(claim).forEach((v) => add(v.id, v.detail));
+  // v18: diagnosis awal (IGD/Poli/Rujukan) vs diagnosis akhir — catatan dokumentasi (tidak menambah skor)
+  if (claim.dxAwal && claim.dxAwal.kode && !dalamPerawatan(claim) && claim.primaryDxCode) {
+    const a = String(claim.dxAwal.kode).trim().toUpperCase(), z = String(claim.primaryDxCode).trim().toUpperCase();
+    if (a !== z) {
+      const kat = _kategoriDx(a) !== _kategoriDx(z);
+      notes.push({ id: "dxAwalBerbeda", label: kat ? `Diagnosis akhir (${z}) berbeda dari diagnosis awal ${claim.dxAwal.asal || ""} (${a})` : `Diagnosis akhir lebih spesifik dari diagnosis awal (${a} → ${z})`,
+        detail: `Diagnosis awal saat masuk${claim.dxAwal.asal ? " dari " + claim.dxAwal.asal : ""}: ${a} ${claim.dxAwal.desk || ""}; diagnosis utama akhir: ${z} ${claim.primaryDxDesc || ""}. ${claim.alasanPerubahanDx ? `Alasan tercatat: "${claim.alasanPerubahanDx}". ` : "Alasan perubahan belum dicatat. "}${kat ? "Verifikator BPJS mencocokkan diagnosis awal (SEP/IGD) dengan diagnosis utama — pastikan resume/CPPT menjelaskan perjalanan klinis dan hasil penunjang yang mendasari perubahan." : "Perubahan dalam kategori yang sama (penajaman kode) umumnya wajar; pastikan didukung pemeriksaan yang tertulis."}` });
+    }
+  }
   // v12: biaya obat klaim jauh di atas kebiasaan kode INA-CBG yang sama (kendali biaya, non-skor)
   {
     const pb = profilBiaya(claim.inacbgCode), bo = parseAngka(claim.biayaObat);
@@ -8045,11 +8081,16 @@ async function analyzeClinicalText(clinicalText, jenisKasus, jenisRawat) {
   // WAJIB ikut cek ada/tidaknya prosedur yang disarankan AI — tarif operasi vs kontrol
   // biasa bisa beda 3-30x lipat utk diagnosis yang sama (lihat catatan di data riwayat).
   const adaProsedurAI = (result.procedures || []).some((p) => (p.code || "").trim());
-  const riwayatRS = findRiwayatInacbg(result.primaryDxCode, adaProsedurAI, "3");
-  const kandidatKataKunci = findCandidateInacbgCodes(result.primaryDxDesc, 4);
-  result.kandidatInacbg = riwayatRS
-    ? [[riwayatRS[3], `${riwayatRS[4]} (riwayat RS ini, ${riwayatRS[5]}x preseden)`, "RI", riwayatRS[6], riwayatRS[6], riwayatRS[6]], ...kandidatKataKunci].slice(0, 4)
-    : kandidatKataKunci;
+  const jenisAI = jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
+  const riwayatRS = findRiwayatInacbg(result.primaryDxCode, adaProsedurAI, "3", jenisAI);
+  const kandidatKataKunci = findCandidateInacbgCodes(result.primaryDxDesc, 4, jenisAI);
+  const pgSaran = result.primaryDxCode ? prediksiInacbg([result.primaryDxCode, ...(result.secondaryDx || []).map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean),
+    (result.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean), jenisAI) : null;
+  const awal = [];
+  if (pgSaran && TARIF_REF_MAP[pgSaran.kode]) { const t = tarifResmiUntuk(pgSaran.kode, "3"); awal.push([pgSaran.kode, `${TARIF_REF_MAP[pgSaran.kode][1]} (model grouper ${pgSaran.acuan ? "acuan" : "RS ini"}, ${pgSaran.jml}x preseden)`, jenisAI, t, t, t]); }
+  if (riwayatRS && !awal.some((a) => a[0] === riwayatRS[3])) awal.push([riwayatRS[3], `${riwayatRS[4]} (riwayat RS ini, ${riwayatRS[5]}x preseden)`, jenisAI, riwayatRS[6], riwayatRS[6], riwayatRS[6]]);
+  result.kandidatInacbg = [...awal, ...kandidatKataKunci.filter((k) => !awal.some((a) => a[0] === k[0]))].slice(0, 4);
+  result.jenisKandidat = jenisAI;
   return result;
 }
 
@@ -8078,6 +8119,16 @@ function konteksPendingIdrgAI(claim) {
 
 // Tarif resmi dari tabel tarif RS yang login, untuk kode INA-CBG + kelas rawat.
 // Rawat jalan hanya punya satu tarif. null = kode tidak ada / tarif tidak tersedia.
+// v17: perkiraan model grouper (sadar RI/RJ & diagnosis sekunder) untuk panel Input Manual
+function perkiraanModelInput(claim) {
+  const dx = [claim.primaryDxCode, ...(claim.secondaryDx || []).map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean);
+  if (!dx.length) return null;
+  const pg = prediksiInacbg(dx, (claim.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean), jenisDariKlaim(claim));
+  if (!pg || pg.jml < 3 || !TARIF_REF_MAP[pg.kode]) return null;
+  const t = tarifResmiUntuk(pg.kode, claim.kelasRawat);
+  if (!t) return null;
+  return { kode: pg.kode, deskripsi: TARIF_REF_MAP[pg.kode][1], jml: pg.jml, tarifMedian: t, kelasRawat: Number(claim.kelasRawat || 3), presisi: true, sumber: pg.acuan ? "acuan" : "rs", model: true };
+}
 function tarifResmiUntuk(kode, kelas) {
   const row = TARIF_REF_MAP[String(kode || "").trim().toUpperCase()];
   if (!row) return null;
@@ -8130,14 +8181,14 @@ async function runClaimAI(claim, allClaims) {
     return cat.known ? cat.title : null;
   })();
   const kodeKosong = !claim.inacbgCode || !claim.inacbgCode.trim();
-  const candidates = kodeKosong ? findCandidateInacbgCodes(claim.primaryDxDesc) : [];
+  const candidates = kodeKosong ? findCandidateInacbgCodes(claim.primaryDxDesc, 6, jenisDariKlaim(claim)) : [];
 
   // Riwayat klaim NYATA RS ini (49.012 klaim tervalidasi, hasil grouper e-Klaim
   // sungguhan Jan-Juli 2026) — sumber PALING otoritatif utk saran kode, di atas
   // kandidat kata kunci maupun riwayat 1 pasien perorangan di bawah ini. WAJIB
   // ikut cek ada/tidaknya prosedur — tarif operasi vs kontrol biasa beda jauh.
   const adaProsedurKlaim = (claim.procedures || []).some((p) => (p.code || "").trim());
-  const riwayatRS = kodeKosong ? findRiwayatInacbg(claim.primaryDxCode, adaProsedurKlaim, claim.kelasRawat) : null;
+  const riwayatRS = kodeKosong ? findRiwayatInacbg(claim.primaryDxCode, adaProsedurKlaim, claim.kelasRawat, jenisDariKlaim(claim)) : null;
 
   // Riwayat pasien ini SENDIRI di sistem kita — kalau pernah masuk sebelumnya dengan
   // diagnosis utama yang sama, kode INA-CBG yang dipakai waktu itu adalah petunjuk kuat
@@ -8251,6 +8302,174 @@ function Section({ title, subtitle, children, right }) {
   );
 }
 
+/* ----------------------------------------------------------------------
+   v18: ALUR PELAYANAN (IGD / Poli / Rujukan → dalam perawatan → pulang)
+---------------------------------------------------------------------- */
+const ASAL_MASUK = [{ value: "", label: "— pilih —" }, { value: "IGD", label: "IGD" }, { value: "Poli", label: "Poli rawat jalan" }, { value: "Rujukan", label: "Rujukan faskes lain (langsung)" }, { value: "Lainnya", label: "Lainnya" }];
+const CARA_PULANG = ["Atas Persetujuan Dokter", "Dirujuk", "Pulang Atas Permintaan Sendiri (APS)", "Meninggal Dunia", "Lainnya"];
+// Aturan yang butuh data akhir pelayanan (LOS, tarif/kode final, tindakan & terapi lengkap) — ditunda selama pasien dirawat
+const ATURAN_TUNDA_DIRAWAT = new Set(["losShortForSeverity", "losRawatJalanTidakWajar", "tariffOutlierStat", "tariffAboveOfficial", "losOutlier", "severityNoCC",
+  "surgicalNoProcedure", "severityCodeMismatch", "dxSekunderKosongTindakanKompleks", "klaimTinggiLosSingkat", "tarifJauhDiAtasBilling", "rawatInapSatuHari",
+  "persalinanTanpaZ37", "pneumoniaKurang72Jam", "kodeBedaPrediksi", "kodeBedaPrediksiAcuan", "terapiTidakTercatat", "biayaObatTinggi", "kodeTidakLazimDx", "sanityLOS"]);
+const _waktuIni = () => new Date().toISOString();
+const _tglIni = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+function _fmtWaktu(w) {
+  if (!w) return "-";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(w)) { const [y, m, d] = w.split("-"); return `${d}/${m}/${y}`; }
+  const d = new Date(w); if (isNaN(d)) return String(w);
+  return d.toLocaleString("id-ID", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+function _kategoriDx(k) { return String(k || "").trim().toUpperCase().slice(0, 3); }
+function dalamPerawatan(c) { return !!c && c.statusPelayanan === "dirawat"; }
+
+// Riwayat kunjungan pasien yang sama (No. RM) di sistem — untuk dokter IGD/Poli & koder
+function RiwayatPasienPanel({ claims, noRM, kecualiId, ringkas, tglAcuan }) {
+  const kunci = String(noRM || "").trim().toUpperCase();
+  const list = useMemo(() => (kunci.length < 3 ? [] : (claims || []).filter((c) => c.id !== kecualiId && String(c.noRM || "").trim().toUpperCase() === kunci)
+    .sort((a, b) => String(b.tglMasuk || "").localeCompare(String(a.tglMasuk || "")))), [claims, kunci, kecualiId]);
+  if (kunci.length < 3) return null;
+  if (!list.length) return <p className="text-xs text-[#94A3AC]">🗂️ Belum ada kunjungan lain untuk No. RM {noRM} di sistem ini.</p>;
+  const frek = {};
+  list.forEach((c) => [[c.primaryDxCode, c.primaryDxDesc], ...(c.secondaryDx || []).map((d) => [d.code, d.desc])].forEach(([k, d]) => {
+    k = String(k || "").trim().toUpperCase(); if (!k) return; const x = (frek[k] = frek[k] || { k, d: d || "", n: 0 }); x.n++; if (!x.d && d) x.d = d; }));
+  const dxSering = Object.values(frek).sort((a, b) => b.n - a.n).slice(0, 8);
+  const acuan = tglAcuan || _tglIni();
+  const terakhir = list.find((c) => (c.tglKeluar || c.tglMasuk) && String(c.tglMasuk || "") <= acuan);
+  const jarak = terakhir ? daysBetween(terakhir.tglKeluar || terakhir.tglMasuk, acuan) : null;
+  return (
+    <div className="bg-[#F4F9FA] border border-[#CFE4E8] rounded-lg p-3.5">
+      <p className="text-sm font-semibold text-[#0F2A3D]">🗂️ Riwayat kunjungan pasien ini ({list.length})</p>
+      <p className="text-xs text-[#5B6B76] mb-2">Dari klaim yang sudah tercatat di sistem untuk No. RM yang sama — bahan pertimbangan diagnosis awal (penyakit kronis, kunjungan berulang). Diagnosis tetap ditetapkan dokter dari pemeriksaan saat ini.</p>
+      {jarak !== null && jarak >= 0 && jarak <= 30 && <p className="text-xs bg-[#FCF1DD] text-[#9A6300] rounded px-2 py-1 mb-2">Kunjungan sebelumnya {jarak} hari {tglAcuan ? "sebelum episode ini" : "lalu"} ({_fmtWaktu(terakhir.tglKeluar || terakhir.tglMasuk)}, {terakhir.primaryDxCode || "-"}) — bila kondisi sama, catat hubungan dengan episode sebelumnya di resume (readmisi ≤30 hari sering ditanyakan verifikator).</p>}
+      {dxSering.length > 0 && <div className="flex flex-wrap gap-1.5 mb-2">{dxSering.map((x) => <span key={x.k} title={x.d} className="text-[11px] bg-white border border-[#CFE4E8] rounded-full px-2 py-0.5"><b className="font-mono">{x.k}</b>{x.d ? ` ${x.d.slice(0, 36)}` : ""} · {x.n}×</span>)}</div>}
+      {!ringkas && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead><tr className="text-left text-[#5B6B76] border-b border-[#CFE4E8]"><th className="py-1 pr-2">Tanggal</th><th className="py-1 pr-2">Layanan</th><th className="py-1 pr-2">Diagnosis utama</th><th className="py-1 pr-2">Kode INA-CBG</th><th className="py-1 pr-2">DPJP</th></tr></thead>
+            <tbody>{list.slice(0, 10).map((c) => (
+              <tr key={c.id} className="border-b border-[#E2EEF1] align-top">
+                <td className="py-1 pr-2 whitespace-nowrap">{_fmtWaktu(c.tglMasuk)}{c.tglKeluar && c.tglKeluar !== c.tglMasuk ? `–${_fmtWaktu(c.tglKeluar)}` : ""}</td>
+                <td className="py-1 pr-2">{c.jenisRawat || "-"}{c.asalMasuk ? ` · dari ${c.asalMasuk}` : c.dariIGD ? " · dari IGD" : ""}{dalamPerawatan(c) ? " · masih dirawat" : ""}</td>
+                <td className="py-1 pr-2"><span className="font-mono font-semibold">{c.primaryDxCode || "-"}</span> {c.primaryDxDesc || ""}{(c.secondaryDx || []).length ? <span className="text-[#94A3AC]"> + {(c.secondaryDx || []).map((d) => d.code).filter(Boolean).join(", ")}</span> : ""}</td>
+                <td className="py-1 pr-2 font-mono">{c.inacbgCode || "-"}</td>
+                <td className="py-1 pr-2">{c.dpjp || "-"}</td>
+              </tr>))}</tbody>
+          </table>
+          {list.length > 10 && <p className="text-[11px] text-[#94A3AC] mt-1">+{list.length - 10} kunjungan lebih lama.</p>}
+        </div>)}
+    </div>
+  );
+}
+
+// Riwayat pelayanan episode ini (masuk → perubahan diagnosis → pulang)
+function RiwayatPelayananEpisode({ claim }) {
+  const ev = (claim.riwayatPelayanan && claim.riwayatPelayanan.length) ? claim.riwayatPelayanan
+    : [claim.tglMasuk && { waktu: claim.tglMasuk, peristiwa: "Masuk", ket: [claim.jenisRawat, claim.dariIGD ? "dari IGD" : ""].filter(Boolean).join(" · ") },
+       claim.tglKeluar && { waktu: claim.tglKeluar, peristiwa: "Pulang", ket: [claim.caraPulang, claim.primaryDxCode ? `Dx akhir ${claim.primaryDxCode} ${claim.primaryDxDesc || ""}` : ""].filter(Boolean).join(" · ") }].filter(Boolean);
+  const awal = claim.dxAwal && claim.dxAwal.kode;
+  const beda = awal && !dalamPerawatan(claim) && String(claim.dxAwal.kode).trim().toUpperCase() !== String(claim.primaryDxCode || "").trim().toUpperCase();
+  const warna = { Masuk: "#0B7285", Pulang: "#1E6B4C", "Diagnosis diperbarui": "#9A6300" };
+  return (
+    <div>
+      <p className="text-sm font-semibold text-[#0F2A3D] mb-2">🧭 Riwayat Pelayanan Episode Ini</p>
+      {awal && (
+        <div className="grid sm:grid-cols-2 gap-2 mb-3 text-xs">
+          <div className="bg-[#F4F9FA] border border-[#CFE4E8] rounded-lg p-2.5"><p className="text-[#94A3AC]">Diagnosis awal ({claim.dxAwal.asal || claim.asalMasuk || "masuk"})</p><p><b className="font-mono">{claim.dxAwal.kode}</b> {claim.dxAwal.desk}</p><p className="text-[#94A3AC]">{_fmtWaktu(claim.dxAwal.waktu)}</p></div>
+          <div className={`rounded-lg p-2.5 border ${beda ? "bg-[#FCF1DD] border-[#F0E6C8]" : "bg-[#E4F3EC] border-[#BFE3D1]"}`}><p className="text-[#94A3AC]">{dalamPerawatan(claim) ? "Diagnosis kerja saat ini" : "Diagnosis akhir"}</p><p><b className="font-mono">{claim.primaryDxCode || "-"}</b> {claim.primaryDxDesc || ""}</p>
+            <p className={beda ? "text-[#9A6300]" : "text-[#1E6B4C]"}>{dalamPerawatan(claim) ? "Pasien masih dalam pelayanan" : beda ? (claim.alasanPerubahanDx ? `Berubah — alasan: ${claim.alasanPerubahanDx}` : "Berubah — alasan belum dicatat") : "Sama dengan diagnosis awal"}</p></div>
+        </div>)}
+      {ev.length === 0 ? <p className="text-xs text-[#94A3AC]">Belum ada catatan waktu pelayanan.</p> : (
+        <ol className="relative border-l-2 border-[#E2E8ED] ml-2 space-y-2.5">
+          {ev.map((e, i) => (
+            <li key={i} className="ml-4">
+              <span className="absolute -left-[7px] mt-1 w-3 h-3 rounded-full border-2 border-white" style={{ background: warna[e.peristiwa] || "#5B6B76" }} />
+              <p className="text-xs"><b style={{ color: warna[e.peristiwa] || "#334652" }}>{e.peristiwa}</b> <span className="text-[#94A3AC]">· {_fmtWaktu(e.waktu)}{e.oleh ? ` · ${e.oleh}` : ""}</span></p>
+              {e.ket && <p className="text-xs text-[#5B6B76]">{e.ket}</p>}
+            </li>))}
+        </ol>)}
+    </div>
+  );
+}
+
+// Form perbarui diagnosis / pasien pulang (di jendela detail klaim)
+function FormPelayanan({ claim, onSimpan, onBatal }) {
+  const [f, setF] = useState(() => ({
+    tglKeluar: claim.tglKeluar || _tglIni(), caraPulang: claim.caraPulang || CARA_PULANG[0], jenisRawat: claim.jenisRawat || "Rawat Inap",
+    primaryDxCode: claim.primaryDxCode || "", primaryDxDesc: claim.primaryDxDesc || "",
+    secondaryDx: (claim.secondaryDx || []).map((d) => ({ code: d.code || "", desc: d.desc || "" })),
+    procedures: (claim.procedures || []).map((p) => ({ code: p.code || "", desc: p.desc || "" })),
+    inacbgCode: claim.inacbgCode || "", kelasRawat: claim.kelasRawat || "3", severityLevel: claim.severityLevel || "I", tarifKlaim: claim.tarifKlaim || "",
+    alasanPerubahanDx: claim.alasanPerubahanDx || "",
+  }));
+  const set = (k) => (e) => setF({ ...f, [k]: e && e.target ? e.target.value : e });
+  const baris = (k, i, field, v) => setF({ ...f, [k]: f[k].map((x, j) => (j === i ? { ...x, [field]: v } : x)) });
+  const awal = claim.dxAwal && claim.dxAwal.kode ? String(claim.dxAwal.kode).trim().toUpperCase() : "";
+  const berubah = awal && awal !== f.primaryDxCode.trim().toUpperCase();
+  const los = losBetween(claim.tglMasuk, f.tglKeluar);
+  const inp = "w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm bg-white";
+  const lbl = "block text-xs text-[#5B6B76] mb-1";
+  const bersih = (arr) => arr.map((x) => ({ code: x.code.trim().toUpperCase(), desc: x.desc.trim() })).filter((x) => x.code);
+  const simpan = (pulang) => {
+    const dx = f.primaryDxCode.trim().toUpperCase();
+    const kode = f.inacbgCode.trim().toUpperCase();
+    const patch = {
+      primaryDxCode: dx, primaryDxDesc: f.primaryDxDesc.trim(), secondaryDx: bersih(f.secondaryDx), procedures: bersih(f.procedures),
+      alasanPerubahanDx: f.alasanPerubahanDx.trim(),
+      riwayatPelayanan: [...(claim.riwayatPelayanan || []), pulang
+        ? { waktu: _waktuIni(), peristiwa: "Pulang", ket: `Keluar ${_fmtWaktu(f.tglKeluar)} (${los === null || los < 0 ? "-" : los} hari) · ${f.caraPulang} · ${f.jenisRawat} · Dx akhir ${dx} ${f.primaryDxDesc.trim()}${bersih(f.secondaryDx).length ? ` + ${bersih(f.secondaryDx).map((d) => d.code).join(", ")}` : ""}`, oleh: PROFIL ? PROFIL.nama : "" }
+        : { waktu: _waktuIni(), peristiwa: "Diagnosis diperbarui", ket: `Dx kerja ${dx} ${f.primaryDxDesc.trim()}${bersih(f.secondaryDx).length ? ` + ${bersih(f.secondaryDx).map((d) => d.code).join(", ")}` : ""}`, oleh: PROFIL ? PROFIL.nama : "" }],
+    };
+    if (pulang) Object.assign(patch, {
+      statusPelayanan: "pulang", tglKeluar: f.tglKeluar, los: los === null || los < 0 ? "" : String(los), caraPulang: f.caraPulang, jenisRawat: f.jenisRawat,
+      inacbgCode: kode, kelasRawat: f.kelasRawat, severityLevel: kode ? (kode.split("-")[3] === "III" ? "III" : kode.split("-")[3] === "II" ? "II" : "I") : f.severityLevel,
+      tarifKlaim: parseAngka(f.tarifKlaim) ? String(parseAngka(f.tarifKlaim)) : String(tarifResmiUntuk(kode, f.kelasRawat) || ""),
+    });
+    onSimpan(patch);
+  };
+  const daftar = (k, judul, ph) => (
+    <div>
+      <p className={lbl}>{judul}</p>
+      <div className="space-y-1.5">
+        {f[k].map((x, i) => (
+          <div key={i} className="flex gap-1.5">
+            <input value={x.code} onChange={(e) => baris(k, i, "code", e.target.value)} placeholder={ph} className={`${inp} font-mono max-w-[110px]`} />
+            <input value={x.desc} onChange={(e) => baris(k, i, "desc", e.target.value)} placeholder="deskripsi" className={inp} />
+            <button type="button" onClick={() => setF({ ...f, [k]: f[k].filter((_, j) => j !== i) })} className="px-2 text-[#94A3AC] hover:text-[#B3261E]"><X size={14} /></button>
+          </div>))}
+        <button type="button" onClick={() => setF({ ...f, [k]: [...f[k], { code: "", desc: "" }] })} className="inline-flex items-center gap-1 text-xs font-medium text-[#0B7285]"><Plus size={13} /> Tambah</button>
+      </div>
+    </div>);
+  return (
+    <div className="p-5 border-b border-[#E2E8ED] bg-[#F7FAFB] space-y-3">
+      <p className="text-sm font-semibold text-[#0F2A3D]">Perbarui diagnosis / Pasien pulang</p>
+      <p className="text-xs text-[#5B6B76]">Masuk {_fmtWaktu(claim.tglMasuk)}{claim.asalMasuk ? ` dari ${claim.asalMasuk}` : ""}{awal ? ` · diagnosis awal ${awal} ${claim.dxAwal.desk || ""}` : ""}. Simpan tanpa memulangkan untuk memperbarui diagnosis kerja; tekan "Pasien Pulang" setelah resume medis selesai.</p>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block"><span className={lbl}>Kode diagnosis utama</span><input value={f.primaryDxCode} onChange={set("primaryDxCode")} className={`${inp} font-mono`} placeholder="mis. J18.9" /></label>
+        <label className="block"><span className={lbl}>Deskripsi diagnosis utama</span><input value={f.primaryDxDesc} onChange={set("primaryDxDesc")} className={inp} /></label>
+      </div>
+      {berubah && (
+        <label className="block bg-[#FCF1DD] border border-[#F0E6C8] rounded-lg p-2.5"><span className="block text-xs text-[#9A6300] mb-1">Diagnosis utama berbeda dari diagnosis awal ({awal}). Tulis alasan klinisnya — dan pastikan juga tertulis di resume/CPPT (sering ditanyakan verifikator):</span>
+          <input value={f.alasanPerubahanDx} onChange={set("alasanPerubahanDx")} className={inp} placeholder="mis. hasil rontgen thorax: infiltrat → pneumonia; keluhan awal sesak" /></label>)}
+      {daftar("secondaryDx", "Diagnosis sekunder (ICD-10)", "kode")}
+      {daftar("procedures", "Tindakan / prosedur (ICD-9-CM)", "kode")}
+      <div className="border-t border-[#E2E8ED] pt-3 grid grid-cols-2 gap-3">
+        <label className="block"><span className={lbl}>Tanggal keluar</span><input type="date" value={f.tglKeluar} onChange={set("tglKeluar")} className={inp} /></label>
+        <label className="block"><span className={lbl}>Cara pulang</span><select value={f.caraPulang} onChange={set("caraPulang")} className={inp}>{CARA_PULANG.map((c) => <option key={c}>{c}</option>)}</select></label>
+        <label className="block"><span className={lbl}>Jenis perawatan akhir</span><select value={f.jenisRawat} onChange={set("jenisRawat")} className={inp}><option>Rawat Inap</option><option>Rawat Jalan</option></select></label>
+        <div className="text-xs text-[#5B6B76] self-end pb-2">Lama rawat: <b>{los === null || los < 0 ? "-" : `${los} hari`}</b></div>
+        <label className="block"><span className={lbl}>Kode INA-CBG (boleh menyusul)</span><input value={f.inacbgCode} onChange={(e) => setF({ ...f, inacbgCode: e.target.value.toUpperCase() })} className={`${inp} font-mono`} placeholder="hasil grouping e-Klaim" /></label>
+        <label className="block"><span className={lbl}>Kelas rawat</span><select value={f.kelasRawat} onChange={set("kelasRawat")} className={inp}><option value="3">Kelas 3</option><option value="2">Kelas 2</option><option value="1">Kelas 1</option></select></label>
+        <label className="block col-span-2"><span className={lbl}>Tarif klaim (Rp) — kosongkan agar terisi dari tabel tarif</span><input type="number" value={f.tarifKlaim} onChange={set("tarifKlaim")} className={inp} placeholder={tarifResmiUntuk(f.inacbgCode, f.kelasRawat) ? `otomatis Rp${Number(tarifResmiUntuk(f.inacbgCode, f.kelasRawat)).toLocaleString("id-ID")}` : ""} /></label>
+      </div>
+      <div className="flex flex-wrap justify-end gap-2 pt-1">
+        <button onClick={onBatal} className="text-xs font-medium text-[#5B6B76] px-3 py-2">Batal</button>
+        {dalamPerawatan(claim) && <button onClick={() => simpan(false)} disabled={!f.primaryDxCode.trim()} className="text-xs font-semibold px-3 py-2 rounded-lg border border-[#0B7285] text-[#0B7285] bg-white disabled:opacity-40">Simpan — masih dirawat</button>}
+        <button onClick={() => simpan(true)} disabled={!f.primaryDxCode.trim() || !f.tglKeluar || (los !== null && los < 0)} className="text-xs font-semibold px-3 py-2 rounded-lg bg-[#1E6B4C] text-white disabled:opacity-40">🏁 {dalamPerawatan(claim) ? "Simpan & Pasien Pulang" : "Simpan data pulang"}</button>
+      </div>
+    </div>
+  );
+}
+
 function TextField({ label, value, onChange, placeholder, type = "text", mono = false, required }) {
   return (
     <label className="block">
@@ -8286,6 +8505,7 @@ function emptyClaim() {
     primaryDxCode: "", primaryDxDesc: "",
     secondaryDx: [], procedures: [],
     inacbgCode: "", severityLevel: "I", jenisKasus: "Medis", jenisRawat: "Rawat Inap", kelasRawat: "3",
+    asalMasuk: "", masihDirawat: false,
     tarifKlaim: "", buktiPenunjang: false,
     specialCMG: false, specialCMGKategori: SPECIAL_CMG_OPTIONS[0],
     resumeMedis: "", sep: null, aiStatus: "idle", aiAnalysis: "",
@@ -8300,7 +8520,7 @@ function emptyClaim() {
   };
 }
 
-function InputManual({ onAdd }) {
+function InputManual({ onAdd, claims = [] }) {
   const [claim, setClaim] = useState(emptyClaim());
   const set = (field) => (val) => setClaim((c) => ({ ...c, [field]: val }));
   const tarifOtomatis = useRef(true);
@@ -8413,7 +8633,7 @@ function InputManual({ onAdd }) {
             )}
             {analysisResult.kandidatInacbg && analysisResult.kandidatInacbg.length > 0 && (
               <div>
-                <p className="text-xs text-[#94A3AC] mb-1">Kandidat Kode INA-CBG (dari tabel tarif resmi, perkiraan awal)</p>
+                <p className="text-xs text-[#94A3AC] mb-1">Kandidat Kode INA-CBG {analysisResult.jenisKandidat === "RJ" ? "rawat jalan" : "rawat inap"} (perkiraan awal — sesuai Jenis Perawatan saat analisis)</p>
                 <div className="space-y-1">
                   {analysisResult.kandidatInacbg.map((c) => (
                     <div key={c[0]} className="flex items-center justify-between gap-2 text-xs bg-white rounded-lg px-2.5 py-1.5 border border-[#E2E8ED]">
@@ -8443,8 +8663,18 @@ function InputManual({ onAdd }) {
           <TextField label="Nama Pasien" value={claim.namaPasien} onChange={set("namaPasien")} />
           <TextField label="DPJP" value={claim.dpjp} onChange={set("dpjp")} placeholder="Nama dokter penanggung jawab" />
           <TextField label="Tanggal Masuk" type="date" value={claim.tglMasuk} onChange={set("tglMasuk")} />
+          {claim.masihDirawat ? (
+            <div className="sm:col-span-2 text-xs bg-[#EAF4F6] border border-[#CFE4E8] text-[#0B5568] rounded-lg px-3 py-2.5 self-end">⏳ <b>Tanggal keluar & lama rawat diisi saat pasien pulang</b> — buka klaim di Dashboard → tombol <b>🏁 Pasien Pulang</b>.</div>
+          ) : (<>
           <TextField label="Tanggal Keluar" type="date" value={claim.tglKeluar} onChange={set("tglKeluar")} />
           <TextField label="Lama Rawat (LOS, hari)" value={claim.los} onChange={set("los")} placeholder="otomatis / isi manual" />
+          </>)}
+          <SelectField label="Asal Masuk" value={claim.asalMasuk} onChange={(v) => setClaim((c) => ({ ...c, asalMasuk: v, dariIGD: v === "IGD" ? true : v ? false : c.dariIGD,
+            masihDirawat: v && !c.tglKeluar ? true : c.masihDirawat, tglMasuk: v && !c.tglMasuk ? _tglIni() : c.tglMasuk }))} options={ASAL_MASUK} />
+          <label className="flex items-start gap-2 cursor-pointer self-end pb-2">
+            <input type="checkbox" checked={!!claim.masihDirawat} onChange={(e) => setClaim((c) => ({ ...c, masihDirawat: e.target.checked, tglKeluar: e.target.checked ? "" : c.tglKeluar, los: e.target.checked ? "" : c.los, tglMasuk: e.target.checked && !c.tglMasuk ? _tglIni() : c.tglMasuk }))} className="mt-0.5 w-4 h-4 accent-[#0B7285]" />
+            <span className="text-sm text-[#334652]">Pasien masih dalam pelayanan <span className="text-xs text-[#94A3AC]">(baru masuk / belum pulang)</span></span>
+          </label>
           <SelectField label="Jenis Kasus" value={claim.jenisKasus} onChange={set("jenisKasus")} options={["Medis", "Bedah"]} />
           <SelectField label="Jenis Perawatan" value={claim.jenisRawat} onChange={set("jenisRawat")} options={["Rawat Inap", "Rawat Jalan"]} />
           <SelectField label="Severity Level" value={claim.severityLevel} onChange={set("severityLevel")} options={["I", "II", "III"]} />
@@ -8459,7 +8689,9 @@ function InputManual({ onAdd }) {
         </div>
       </Section>
 
-      <Section title="Diagnosis" subtitle="Diagnosis utama & sekunder (ICD-10)">
+      {String(claim.noRM || "").trim().length >= 3 && <div className="-mt-1"><RiwayatPasienPanel claims={claims} noRM={claim.noRM} /></div>}
+
+      <Section title="Diagnosis" subtitle={claim.masihDirawat ? "Diagnosis awal / kerja (ICD-10) — disimpan sebagai diagnosis awal; diagnosis akhir diisi saat pasien pulang" : "Diagnosis utama & sekunder (ICD-10)"}>
         <div className="grid sm:grid-cols-2 gap-4 mb-4">
           <TextField label="Kode Diagnosis Utama" value={claim.primaryDxCode} onChange={set("primaryDxCode")} required mono placeholder="mis. A41.9" />
           <TextField label="Deskripsi Diagnosis Utama (isi ini juga supaya perkiraan tarif di bawah muncul)" value={claim.primaryDxDesc} onChange={set("primaryDxDesc")} placeholder="mis. Septicaemia, unspecified" />
@@ -8473,12 +8705,15 @@ function InputManual({ onAdd }) {
           // sekunder — otomatis memperbarui saat baris prosedur/sekunder ditambah/dihapus.
           const jmlSekunder = (claim.secondaryDx || []).filter((d) => (d.code || "").trim()).length;
           const adaProsedur = (claim.procedures || []).some((d) => (d.code || "").trim());
-          const riwayat = findRiwayatInacbgPresisi(claim.primaryDxCode, adaProsedur, jmlSekunder, claim.kelasRawat);
+          const jenisIM = jenisDariKlaim(claim);
+          const pgIM = perkiraanModelInput(claim);
+          const riwayat = pgIM || findRiwayatInacbgPresisi(claim.primaryDxCode, adaProsedur, jmlSekunder, claim.kelasRawat, jenisIM);
           if (riwayat) {
             const kelasBeda = riwayat.kelasRawat !== Number(claim.kelasRawat || 3);
             return (
               <div className="mb-4 bg-[#E4F3EC] border border-[#BFE3D1] rounded-lg p-3.5">
-                <p className="text-sm font-semibold text-[#0F2A3D] mb-1">✅ {riwayat.sumber === "acuan" ? "Berdasarkan Pola Grouping Acuan" : "Berdasarkan Riwayat Klaim RS Ini"} ({riwayat.jml}x preseden nyata)</p>
+                <p className="text-sm font-semibold text-[#0F2A3D] mb-1">✅ {riwayat.model ? `Perkiraan Model Grouper ${riwayat.sumber === "acuan" ? "Acuan" : "RS Ini"} — ${jenisIM === "RJ" ? "Rawat Jalan" : "Rawat Inap"}` : riwayat.sumber === "acuan" ? "Berdasarkan Pola Grouping Acuan" : "Berdasarkan Riwayat Klaim RS Ini"} ({riwayat.jml}x preseden nyata)</p>
+                {riwayat.model && <p className="text-xs text-[#5B6B76] mb-1">Dari diagnosis utama{(claim.secondaryDx || []).some((d) => (d.code || "").trim()) ? ", diagnosis sekunder" : ""}{adaProsedur ? " dan tindakan" : ""} yang sudah diisi (uji mundur 98,7% tepat). Severity ikut diagnosis sekunder — bertambah bila komorbid/komplikasi dicatat.</p>}
                 <p className="text-xs text-[#5B6B76] mb-3">
                   Kode ini paling sering dipakai untuk diagnosis "{claim.primaryDxCode}" <b>{adaProsedur ? "DENGAN prosedur/tindakan" : "TANPA prosedur (kontrol/konservatif)"}</b>{riwayat.presisi ? `, ${jmlSekunder === 0 ? "tanpa diagnosis sekunder" : jmlSekunder === 1 ? "1 diagnosis sekunder" : "2+ diagnosis sekunder"}` : ""}{riwayat.sumber === "acuan" ? ` — dari pola grouping acuan sistem (${RIWAYAT_ACUAN_INFO.jumlah.toLocaleString("id-ID")} klaim hasil grouper e-Klaim sungguhan di RS rujukan; logika grouper berlaku nasional, tarif sesuai tabel tarif RS Anda)` : ` — di klaim RS Anda sendiri (${RIWAYAT_INFO.periode ? RIWAYAT_INFO.periode + ", " : ""}hasil grouper e-Klaim sungguhan)`}{kelasBeda ? ` — preseden dari Kelas ${riwayat.kelasRawat} (kelas rawat Anda belum ada datanya)` : ""}.
                   {!riwayat.presisi && " Belum ada preseden sepresisi itu — kode di bawah dari pola diagnosis + status prosedur yang sama, jumlah diagnosis sekunder dilonggarkan."}
@@ -8494,7 +8729,7 @@ function InputManual({ onAdd }) {
           }
           return null;
         })()}
-        {!claim.inacbgCode && !findRiwayatInacbg(claim.primaryDxCode, (claim.procedures || []).some((d) => (d.code || "").trim()), claim.kelasRawat) && (() => {
+        {!claim.inacbgCode && !perkiraanModelInput(claim) && !findRiwayatInacbg(claim.primaryDxCode, (claim.procedures || []).some((d) => (d.code || "").trim()), claim.kelasRawat, jenisDariKlaim(claim)) && (() => {
           // Kalau kolom deskripsi masih kosong tapi kode ICD-10 sudah diisi, coba
           // ambil judul kategori resminya dulu — supaya panel ini tetap bisa muncul
           // meski pengguna cuma isi kode tanpa sempat mengetik deskripsi manual.
@@ -8502,12 +8737,12 @@ function InputManual({ onAdd }) {
             ? claim.primaryDxDesc
             : (() => { const cat = findICD10Category3(claim.primaryDxCode); return cat.known ? cat.title : ""; })();
           if (!deskripsiDipakai || deskripsiDipakai.trim().length < 4) return null;
-          const kandidat = findCandidateInacbgCodes(deskripsiDipakai, 4);
+          const kandidat = findCandidateInacbgCodes(deskripsiDipakai, 4, jenisDariKlaim(claim));
           if (kandidat.length === 0) return null;
           return (
             <div className="mb-4 bg-[#FBF8F0] border border-[#F0E6C8] rounded-lg p-3.5">
               <p className="text-sm font-semibold text-[#0F2A3D] mb-1">💰 Perkiraan Besaran Klaim (langsung dari diagnosis)</p>
-              <p className="text-xs text-[#5B6B76] mb-3">Belum ada preseden klaim RS ini utk diagnosis ini — perkiraan berdasarkan kemiripan kata kunci dgn tabel tarif resmi Permenkes No. 3/2023 — BUKAN hasil grouper e-Klaim. Tarif sesuai Kelas Rawat {claim.kelasRawat || "3"}.</p>
+              <p className="text-xs text-[#5B6B76] mb-3">Belum ada preseden klaim RS ini utk diagnosis ini — perkiraan berdasarkan kemiripan kata kunci dgn tabel tarif resmi Permenkes No. 3/2023 — BUKAN hasil grouper e-Klaim. Tarif sesuai Kelas Rawat {claim.kelasRawat || "3"}. Hanya kode <b>{jenisDariKlaim(claim) === "RJ" ? "rawat jalan" : "rawat inap"}</b> (sesuai Jenis Perawatan).</p>
               <div className="space-y-1.5">
                 {kandidat.map((c) => {
                   const tarif = c[2] === "RJ" ? c[3] : { "3": c[3], "2": c[4], "1": c[5] }[claim.kelasRawat || "3"];
@@ -8524,11 +8759,11 @@ function InputManual({ onAdd }) {
             </div>
           );
         })()}
-        {!claim.inacbgCode && claim.primaryDxCode && !findRiwayatInacbg(claim.primaryDxCode, (claim.procedures || []).some((d) => (d.code || "").trim()), claim.kelasRawat) && (() => {
+        {!claim.inacbgCode && claim.primaryDxCode && !perkiraanModelInput(claim) && !findRiwayatInacbg(claim.primaryDxCode, (claim.procedures || []).some((d) => (d.code || "").trim()), claim.kelasRawat, jenisDariKlaim(claim)) && (() => {
           const cat = findICD10Category3(claim.primaryDxCode);
           const deskripsiDipakai = (claim.primaryDxDesc || "").trim().length >= 4 ? claim.primaryDxDesc : (cat.known ? cat.title : "");
           if (deskripsiDipakai && deskripsiDipakai.trim().length >= 4) {
-            const kandidat = findCandidateInacbgCodes(deskripsiDipakai, 4);
+            const kandidat = findCandidateInacbgCodes(deskripsiDipakai, 4, jenisDariKlaim(claim));
             if (kandidat.length > 0) return null; // panel utama sudah menampilkan
             return <p className="text-xs text-[#94A3AC] mb-4 -mt-2">💡 Diagnosis "{deskripsiDipakai}" dikenali, tapi tidak ada preseden/kandidat kode INA-CBG yang cocok — silakan isi Kode INA-CBG & Tarif Klaim manual setelah grouper e-Klaim.</p>;
           }
@@ -8681,7 +8916,17 @@ function InputManual({ onAdd }) {
             jenisKunjungan: claim.sepJenisKunjungan, poliPerujuk: claim.sepPoliPerujuk, kelasHak: claim.sepKelasHak,
             penjamin: claim.sepPenjamin, noTelepon: claim.sepNoTelepon, catatan: claim.sepCatatan,
           } : null;
-          onAdd({ ...claim, sep });
+          // v18: episode pelayanan — status, diagnosis awal, riwayat pelayanan
+          const { masihDirawat, ...isiKlaim } = claim;
+          const kini = _waktuIni(), oleh = PROFIL ? PROFIL.nama : "";
+          const ep = { ...isiKlaim, sep };
+          if (ep.jenisRawat === "Rawat Jalan" && !masihDirawat && ep.tglMasuk && !ep.tglKeluar) { ep.tglKeluar = ep.tglMasuk; ep.los = ep.los || "1"; }
+          ep.statusPelayanan = masihDirawat ? "dirawat" : "pulang";
+          if (masihDirawat) { ep.tglKeluar = ""; ep.los = ""; }
+          if (ep.primaryDxCode && (masihDirawat || ep.asalMasuk)) ep.dxAwal = { kode: ep.primaryDxCode.trim().toUpperCase(), desk: (ep.primaryDxDesc || "").trim(), waktu: kini, asal: ep.asalMasuk || "" };
+          ep.riwayatPelayanan = [{ waktu: kini, peristiwa: "Masuk", ket: [ep.asalMasuk ? `dari ${ep.asalMasuk}` : "", ep.jenisRawat, ep.dpjp ? `DPJP ${ep.dpjp}` : "", ep.primaryDxCode ? `Dx ${masihDirawat ? "awal" : "utama"} ${ep.primaryDxCode} ${ep.primaryDxDesc || ""}` : ""].filter(Boolean).join(" · "), oleh }];
+          if (!masihDirawat && ep.tglKeluar) ep.riwayatPelayanan.push({ waktu: kini, peristiwa: "Pulang", ket: `Dicatat lengkap saat input (keluar ${_fmtWaktu(ep.tglKeluar)})`, oleh });
+          onAdd(ep);
           (tarifOtomatis.current = true, setClaim(emptyClaim()));
           // Reset juga panel Bantuan AI — kalau tidak, teks & saran diagnosis pasien
           // SEBELUMNYA masih tampil saat mulai input pasien berikutnya, bikin rancu
@@ -9819,6 +10064,170 @@ function KodeResmiDisebutAI({ teks, kelas }) {
 // Lembar Input Koding e-Klaim: diagnosis utama, sekunder & tindakan (ICD-9-CM) yang siap
 // disalin ke aplikasi e-Klaim/berkas BPJS. Bisa menampilkan data klaim saat ini, atau
 // USULAN setelah rekomendasi AI (ditandai jelas belum diverifikasi).
+/* ----------------------------------------------------------------------
+   v19: RINCIAN SEVERITY — severity INA-CBG ditentukan diagnosis sekunder yang TERBUKTI di rekam medis.
+   Tidak ada saran "menambah diagnosis untuk menaikkan tarif": kondisi hanya disarankan dikode bila
+   sudah tertulis di dokumen; bila belum tertulis, yang disediakan hanya draf pertanyaan ke DPJP.
+---------------------------------------------------------------------- */
+// [pola kode, kondisi, bukti klinis/penunjang [[label, regex]], kelompok terapi (OBAT_RE), kata diagnosis di resume, kode saran, cek lab]
+const BUKTI_SEVERITY = [
+  [/^(D64|D50|D62|D63)/, "anemia", [["Hasil Hb/hemoglobin", /\b(hb|hgb|hemoglobin)\b/i]], "anemia", /\banemia\b|\banemis\b/i, "D64.9", "hb"],
+  [/^O99\.0/, "anemia dalam kehamilan", [["Hasil Hb/hemoglobin", /\b(hb|hgb|hemoglobin)\b/i]], "anemia", null, null, "hb"],
+  [/^E87\.6/, "hipokalemia", [["Hasil kalium (serial lebih baik)", /\bkalium\b|\bK\s*[:=]\s*\d|\bK\+/i]], "kalium", /hipokalemi|hypokalemi/i, "E87.6", "k"],
+  [/^E87\.1/, "hiponatremia", [["Hasil natrium", /\bnatrium\b|\bNa\s*[:=]\s*\d|\bNa\+/i]], "natrium", /hiponatremi|hyponatremi/i, "E87.1", "na"],
+  [/^E87\.2/, "asidosis", [["Hasil AGD (pH/HCO3)", /\bAGD\b|analisa\s*gas\s*darah|\bpH\s*[:=]?\s*7[.,]\d|HCO3/i]], null, /asidosis|acidosis/i, "E87.2", null],
+  [/^(N39\.0|N30)/, "infeksi saluran kemih", [["Hasil urinalisis/kultur urin", /urinalisis|urin\s*lengkap|\bUL\b|leukosit\s*urin|nitrit|kultur\s*urin|bakteri\s*urin/i]], "antibiotik", /\bISK\b|infeksi\s*saluran\s*kemih|\bUTI\b|sistitis/i, "N39.0", null],
+  [/^I50/, "gagal jantung", [["Klinis gagal jantung (sesak/edema/ronki/JVP)", /edema|ronki|rhonki|\bJVP\b|ortopnea|sesak/i], ["Rontgen/ekokardiografi (kardiomegali, EF)", /kardiomegali|cardiomegal|\bCTR\b|ekokardiografi|echocardiograph|\bEF\b|ejeksi/i]], "diuretik", /\bCHF\b|gagal\s*jantung|heart\s*failure|\bADHF\b|decomp/i, "I50.0", null],
+  [/^R57/, "syok", [["Tekanan darah (sistolik <90/MAP <65)", /\bTD\b|tekanan\s*darah|\bMAP\b|\d{2,3}\s*\/\s*\d{2,3}\s*mmHg/i]], "vasopresor", /\bsyok\b|\bshock\b|renjatan/i, "R57.9", null],
+  [/^J96/, "gagal napas", [["SpO2/AGD (PaO2, PaCO2)", /spo2|saturasi|\bAGD\b|pao2|paco2/i]], "oksigen", /gagal\s*napas|gagal\s*nafas|respiratory\s*failure/i, "J96.0", "spo2"],
+  [/^A4[01]/, "sepsis", [["Sumber infeksi & kriteria disfungsi organ (tanda vital, laktat, leukosit)", /laktat|lactate|qsofa|\bSOFA\b|leukosit|procalcitonin|prokalsitonin/i], ["Kultur darah", /kultur\s*darah|blood\s*culture/i]], "antibiotik", /\bsepsis\b|septik|septic/i, "A41.9", null],
+  [/^I48/, "fibrilasi atrium", [["EKG fibrilasi atrium", /\bEKG\b|\bECG\b|elektrokardiogra/i]], null, /\bAF\b|atrial\s*fibril|fibrilasi\s*atri/i, "I48", null],
+  [/^J44/, "PPOK", [["Riwayat/spirometri PPOK", /ppok|copd|spirometri/i]], "oksigen", /\bPPOK\b|\bCOPD\b/i, "J44.9", null],
+  [/^K92/, "perdarahan saluran cerna", [["Klinis hematemesis/melena", /hematemesis|melena|muntah\s*darah|BAB\s*hitam/i], ["Hasil Hb", /\b(hb|hemoglobin)\b/i]], null, /hematemesis|melena|perdarahan\s*saluran\s*cerna/i, "K92.2", "hb"],
+  [/^D69\.6/, "trombositopenia", [["Hasil trombosit", /trombosit|\bPLT\b|platelet/i]], null, /trombositopeni|thrombocytopeni/i, "D69.6", "plt"],
+  [/^I6[34]/, "stroke", [["CT scan kepala", /\bCT\b|ct\s*scan|msct/i], ["Defisit neurologis", /hemiparesis|hemiplegi|lateralisasi|parese|afasia|pelo|NIHSS/i]], null, /\bstroke\b|\bCVD\b|\bSNH\b|infark\s*serebr/i, "I63.9", null],
+  [/^E1[0-4]/, "diabetes melitus", [["GDS/GDP/HbA1c", /\bGDS\b|\bGDP\b|gula\s*darah|HbA1c|glukosa/i]], "antidiabetik", /\bDM\b|diabetes/i, "E11.9", null],
+  [/^O14\.1/, "preeklampsia berat", [["TD ≥160/110", /\bTD\b|tekanan\s*darah|mmHg/i], ["Proteinuria", /protein\s*urin|proteinuri/i]], "mgso4", /\bPEB\b|preeklampsia\s*berat|severe\s*pre-?eclampsia/i, "O14.1", null],
+  [/^E05/, "tirotoksikosis", [["FT4/TSH", /\bFT4\b|\bTSH\b|\bT4\b/i]], null, /tirotoksikosis|hipertiroid|thyrotox/i, "E05.9", null],
+  [/^N20/, "batu saluran kemih", [["USG/BNO-IVP", /\bUSG\b|\bBNO\b|\bIVP\b|ultrasonogra/i]], null, /nefrolitiasis|batu\s*ginjal|urolitiasis|\bBSK\b/i, "N20.0", null],
+  [/^(R56|G40|G41)/, "kejang", [["Kejadian kejang tercatat", /kejang|seizure|konvulsi/i]], "antikonvulsan", /kejang|seizure/i, "R56.8", null],
+  [/^J1[2-8]/, "pneumonia", [["Rontgen thorax (infiltrat/konsolidasi)", /thorax|thoraks|rontgen|infiltrat|konsolidasi/i]], "antibiotik", /pneumoni|bronkopneumoni/i, "J18.9", null],
+  [/^E86/, "dehidrasi", [["Tanda dehidrasi", /dehidrasi|turgor|mata\s*cekung|mukosa\s*kering/i]], "rehidrasi", /dehidrasi/i, "E86", null],
+  [/^N17/, "gangguan ginjal akut", [["Ureum/kreatinin", /ureum|kreatinin|creatinin/i]], null, /\bAKI\b|gagal\s*ginjal\s*akut|acute\s*kidney/i, "N17.9", null],
+];
+// nilai lab sederhana dari teks resume → [nilai...]
+function _nilaiLab(teks, jenis) {
+  const pola = { k: /(?:kalium|\bK\+?)\s*(?:\([^)]*\))?\s*[:=]?\s*([0-9]+[.,][0-9]+)/gi, na: /(?:natrium|\bNa\+?)\s*[:=]?\s*([0-9]{3}(?:[.,][0-9]+)?)/gi,
+    hb: /(?:\bhb\b|\bhgb\b|hemoglobin)\s*[:=]?\s*([0-9]{1,2}(?:[.,][0-9]+)?)/gi, plt: /(?:trombosit|\bplt\b)\s*[:=]?\s*([0-9]{1,3}(?:[.,][0-9]{3})*)/gi, spo2: /spo2\s*[:=]?\s*([0-9]{2,3})\s*%?/gi }[jenis];
+  if (!pola || !teks) return [];
+  const out = []; let m; pola.lastIndex = 0;
+  while ((m = pola.exec(teks)) !== null) { let v = m[1]; v = jenis === "plt" ? Number(v.replace(/[.,]/g, "")) : parseFloat(v.replace(",", ".")); if (!isNaN(v)) out.push(v); }
+  return out;
+}
+const _LAB_ABNORMAL = { k: [(v) => v < 3.5, "kalium < 3,5"], na: [(v) => v < 135, "natrium < 135"], hb: [(v) => v < 10, "Hb < 10 g/dL"], plt: [(v) => v < 150000 && v > 0, "trombosit < 150.000"], spo2: [(v) => v < 90, "SpO2 < 90%"] };
+const _LABEL_LAB = { k: "Kalium", na: "Natrium", hb: "Hb", plt: "Trombosit", spo2: "SpO2" };
+
+function analisisSeverity(claim) {
+  const up = (x) => String(x || "").trim().toUpperCase();
+  const du = up(claim.primaryDxCode);
+  const sek = (claim.secondaryDx || []).map((d) => ({ kode: up(d.code), desk: d.desc || "" })).filter((d) => d.kode);
+  const px = (claim.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean);
+  const teks = String(claim.resumeMedis || "");
+  const rj = claim.jenisRawat === "Rawat Jalan";
+  const kode = up(claim.inacbgCode);
+  const pg = !rj && du ? prediksiInacbg([du, ...sek.map((d) => d.kode)], px, "RI") : null;
+  const dasar = (kode && /^[A-Z]-[146]-\d{2}-/.test(kode) ? kode : pg ? pg.kode : "").split("-").slice(0, 3).join("-");
+  const tingkat = dasar ? ["I", "II", "III"].map((v) => ({ sev: v, kode: `${dasar}-${v}`, desk: TARIF_REF_MAP[`${dasar}-${v}`] ? TARIF_REF_MAP[`${dasar}-${v}`][1] : "", tarif: tarifResmiUntuk(`${dasar}-${v}`, claim.kelasRawat) })) : [];
+  const sevKini = kode && kode.startsWith(dasar) ? kode.split("-")[3] : pg ? pg.kode.split("-")[3] : "";
+  const levelDari = new Map((pg ? pg.penentu : []).map(([c, v]) => [c, v]));
+  const cekBukti = (r) => r[2].map(([label, re]) => { const m = teks.match(re); return { label, ada: !!m, kutip: m ? teks.slice(Math.max(0, m.index - 20), m.index + 50).replace(/\s+/g, " ").trim() : "" }; });
+  const cekLab = (j) => { if (!j) return null; const v = _nilaiLab(teks, j); return v.length ? { label: _LABEL_LAB[j], nilai: v, abnormal: v.some(_LAB_ABNORMAL[j][0]), batas: _LAB_ABNORMAL[j][1] } : null; };
+  // 1. diagnosis sekunder yang dikode — penentu severity + bukti
+  const penentu = sek.map((d) => {
+    const r = BUKTI_SEVERITY.find(([re]) => re.test(d.kode));
+    const level = levelDari.get(d.kode) || 1;
+    if (!r && level < 2) return null;
+    const bukti = r ? cekBukti(r) : [];
+    const terapi = r && r[3] ? { label: LABEL_TERAPI[r[3]] || r[3], ada: obatTercatat(r[3], teks) } : null;
+    const lab = r ? cekLab(r[6]) : null;
+    const lengkap = !!r && teks.length >= 80 && bukti.every((b) => b.ada) && (!terapi || terapi.ada) && (!lab || lab.abnormal);
+    return { ...d, kondisi: r ? r[1] : "", level, bukti, terapi, lab, lengkap, adaTeks: teks.length >= 80, baku: !!r };
+  }).filter(Boolean).sort((a, b) => b.level - a.level);
+  // 2. kondisi tertulis di resume tetapi belum dikode (kemungkinan under-coding)
+  const semua = new Set([du, ...sek.map((d) => d.kode)]);
+  const tertulis = teks.length < 80 ? [] : BUKTI_SEVERITY.filter((r) => r[4] && r[5] && r[4].test(teks) && ![...semua].some((k) => r[0].test(k)))
+    .map((r) => { const m = teks.match(r[4]); return { kondisi: r[1], kodeSaran: r[5], kutip: teks.slice(Math.max(0, m.index - 30), m.index + 60).replace(/\s+/g, " ").trim(),
+      terapi: r[3] ? { label: LABEL_TERAPI[r[3]] || r[3], ada: obatTercatat(r[3], teks) } : null, level: (GROUPER_RS || GROUPER_ACUAN) && dasar ? ((GROUPER_RS || GROUPER_ACUAN).lvb[`${dasar}|${r[5]}`] ?? (GROUPER_RS || GROUPER_ACUAN).lv[r[5]] ?? (GROUPER_RS || GROUPER_ACUAN).lk[r[5].slice(0, 3)] ?? 1) : null }; })
+    .filter((x, i, a) => a.findIndex((y) => y.kodeSaran === x.kodeSaran) === i);
+  // 3. nilai lab abnormal tanpa diagnosis tertulis → hanya query DPJP
+  const query = [];
+  if (teks.length >= 80) ["k", "na", "hb", "plt"].forEach((j) => {
+    const lab = cekLab(j); if (!lab || !lab.abnormal) return;
+    const r = BUKTI_SEVERITY.find((x) => x[6] === j && x[5]);
+    if (!r || [...semua].some((k) => r[0].test(k)) || tertulis.some((t) => t.kodeSaran === r[5])) return;
+    query.push({ lab, kondisi: r[1], teks: `${_LABEL_LAB[j]} tercatat ${lab.nilai.map((v) => v.toLocaleString("id-ID")).join("; ")} (${lab.batas}). Apakah pasien didiagnosis ${r[1]} dan mendapat tatalaksananya? Bila ya, mohon dituliskan diagnosis dan tatalaksananya di CPPT/resume; bila tidak bermakna klinis, mohon konfirmasi.` });
+  });
+  return { rj, dasar, tingkat, sevKini, penentu, tertulis, query, model: !!pg, acuan: pg ? pg.acuan : false, adaTeks: teks.length >= 80 };
+}
+
+function RincianSeverity({ claim }) {
+  const [buka, setBuka] = useState(true);
+  const [disalin, setDisalin] = useState(false);
+  const a = useMemo(() => analisisSeverity(claim), [claim]);
+  if (!claim.primaryDxCode) return null;
+  const rp = (v) => (v ? "Rp" + Number(v).toLocaleString("id-ID") : "–");
+  const ok = <span className="text-[#1E6B4C] font-semibold">✓</span>, no = <span className="text-[#B3261E] font-semibold">✗</span>;
+  const draf = () => {
+    const daftar = [
+      ...a.penentu.filter((p) => p.baku && !p.lengkap && p.adaTeks).map((p) => `${p.kode} (${p.kondisi || p.desk}) sudah dikode sebagai diagnosis sekunder, tetapi bukti berikut belum ditemukan di resume: ${[...p.bukti.filter((b) => !b.ada).map((b) => b.label), ...(p.terapi && !p.terapi.ada ? [`terapi ${p.terapi.label}`] : []), ...(p.lab && !p.lab.abnormal ? [`nilai ${p.lab.label} tidak menunjukkan ${p.lab.batas}`] : [])].join(", ")}. Mohon konfirmasi apakah kondisi ini ditegakkan dan ditatalaksana.`),
+      ...a.tertulis.map((t) => `Di resume tertulis "${t.kutip}". Apakah ${t.kondisi} merupakan diagnosis yang ditegakkan pada episode ini${t.terapi && !t.terapi.ada ? ` (tatalaksana ${t.terapi.label} belum tercatat)` : ""}?`),
+      ...a.query.map((q) => q.teks),
+    ];
+    const t = `Kepada Yth. ${claim.dpjp || "DPJP"},\nMohon konfirmasi untuk pasien ${claim.namaPasien || ""} (No. RM ${claim.noRM}) ${claim.tglMasuk || ""}:\n${daftar.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n\nKonfirmasi ini untuk ketepatan koding sesuai kondisi klinis pasien. Terima kasih.\n— Koder/Casemix`;
+    const isi = samarkanTeks(t, [claim]);
+    try { navigator.clipboard.writeText(isi).then(() => { setDisalin(true); setTimeout(() => setDisalin(false), 2500); }, () => window.prompt("Salin draf query berikut:", isi)); }
+    catch (e) { window.prompt("Salin draf query berikut:", isi); }
+  };
+  const adaQuery = a.penentu.some((p) => p.baku && !p.lengkap && p.adaTeks) || a.tertulis.length || a.query.length;
+  return (
+    <div className="border border-[#E2E8ED] rounded-lg">
+      <button type="button" onClick={() => setBuka(!buka)} className="w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+        <span className="text-sm font-semibold text-[#0F2A3D]">⚖️ Rincian Severity</span>
+        <span className="text-xs text-[#94A3AC]">{buka ? "tutup" : "buka"}</span>
+      </button>
+      {buka && (
+        <div className="px-3.5 pb-3.5 space-y-3 text-xs">
+          <p className="text-[#5B6B76]">Severity INA-CBG <b>ditentukan oleh diagnosis sekunder yang terbukti</b> di rekam medis, bukan dipilih. Tingkat di bawah ditampilkan sebagai informasi — kode hanya boleh mengikuti kondisi yang ditegakkan DPJP dan tertulis di dokumen.</p>
+          {a.rj && <p className="text-[#5B6B76]">Rawat jalan tidak berjenjang severity (kode berakhiran -0).</p>}
+          {!a.rj && a.tingkat.length > 0 && (
+            <div className="grid grid-cols-3 gap-2">
+              {a.tingkat.map((t) => (
+                <div key={t.sev} className={`rounded-lg border p-2 ${t.sev === a.sevKini ? "border-[#0B7285] bg-[#EAF4F6]" : "border-[#E2E8ED]"}`}>
+                  <p className="font-mono font-semibold text-[#0F2A3D]">{t.kode}</p>
+                  <p className="text-[#94A3AC]">{t.sev === "I" ? "tanpa CC" : t.sev === "II" ? "dengan CC (komorbid/komplikasi sedang)" : "dengan MCC (berat)"}</p>
+                  <p className="font-medium">{rp(t.tarif)}</p>
+                  {t.sev === a.sevKini && <p className="text-[#0B7285] font-semibold">{claim.inacbgCode && claim.inacbgCode.toUpperCase().startsWith(a.dasar) ? "kode klaim ini" : "perkiraan saat ini"}</p>}
+                </div>))}
+            </div>)}
+          {!a.rj && (
+            <div>
+              <p className="font-semibold text-[#334652] mb-1">Diagnosis sekunder yang menentukan severity & buktinya</p>
+              {a.penentu.length === 0 ? <p className="text-[#94A3AC]">Tidak ada diagnosis sekunder penaik severity yang dikode{a.model ? " (menurut model grouper RS ini)" : ""}.</p> : (
+                <ul className="space-y-1.5">{a.penentu.map((p) => (
+                  <li key={p.kode} className={`rounded-lg border p-2 ${!p.adaTeks || !p.baku ? "border-[#E2E8ED]" : p.lengkap ? "border-[#BFE3D1] bg-[#F3FAF6]" : "border-[#F0E6C8] bg-[#FBF8F0]"}`}>
+                    <p><b className="font-mono">{p.kode}</b> {p.desk || p.kondisi} {p.level >= 2 && <span className="text-[#0B7285]">· menaikkan ke tingkat {p.level === 3 ? "III" : "II"}</span>}</p>
+                    {!p.adaTeks ? <p className="text-[#94A3AC]">Resume belum diunggah/diringkas — bukti belum bisa dicek otomatis.</p> : (
+                      <ul className="mt-0.5 space-y-0.5">
+                        {p.bukti.map((b) => <li key={b.label}>{b.ada ? ok : no} {b.label}{b.ada && b.kutip ? <span className="text-[#94A3AC]"> — “…{b.kutip}…”</span> : ""}</li>)}
+                        {p.lab && <li>{p.lab.abnormal ? ok : no} {p.lab.label} tercatat {p.lab.nilai.map((v) => v.toLocaleString("id-ID")).join("; ")} {p.lab.abnormal ? `(memenuhi ${p.lab.batas})` : `— tidak menunjukkan ${p.lab.batas}`}</li>}
+                        {p.terapi && <li>{p.terapi.ada ? ok : no} Tatalaksana: {p.terapi.label}</li>}
+                        {!p.baku && <li className="text-[#5B6B76]">Belum ada daftar bukti baku untuk kode ini di sistem — verifikasi manual ke resume/penunjang.</li>}
+                        {p.baku && !p.lengkap && <li className="text-[#9A6300]">Bukti belum lengkap → konfirmasi DPJP. Bila kondisi tidak ditegakkan, diagnosis ini harus dihapus (severity turun) — jangan dipertahankan tanpa bukti.</li>}
+                      </ul>)}
+                  </li>))}</ul>)}
+            </div>)}
+          {a.tertulis.length > 0 && (
+            <div>
+              <p className="font-semibold text-[#334652] mb-1">Tertulis di resume, belum dikode — kemungkinan terlewat</p>
+              <ul className="space-y-1.5">{a.tertulis.map((t) => (
+                <li key={t.kodeSaran} className="rounded-lg border border-[#CFE4E8] bg-[#F4F9FA] p-2">
+                  <p><b>{t.kondisi}</b> — “…{t.kutip}…”</p>
+                  <p className="text-[#5B6B76]">Bila memang ditegakkan DPJP pada episode ini, kode yang sesuai mis. <b className="font-mono">{t.kodeSaran}</b>{t.level >= 2 ? ` (penaik severity ke ${t.level === 3 ? "III" : "II"})` : ""}{t.terapi ? ` · tatalaksana ${t.terapi.label}: ${t.terapi.ada ? "tercatat" : "belum tercatat"}` : ""}. Verifikasi ke rekam medis sebelum menambahkan.</p>
+                </li>))}</ul>
+            </div>)}
+          {a.query.length > 0 && (
+            <div>
+              <p className="font-semibold text-[#334652] mb-1">Nilai lab abnormal tanpa diagnosis tertulis — tanyakan ke DPJP (jangan langsung dikode)</p>
+              <ul className="list-disc list-inside space-y-0.5 text-[#5B6B76]">{a.query.map((q, i) => <li key={i}>{q.teks}</li>)}</ul>
+            </div>)}
+          {!a.adaTeks && !a.rj && <p className="text-[#94A3AC]">Unggah resume medis/ringkasan klinis agar bukti dan kondisi yang tertulis bisa dicek otomatis.</p>}
+          {adaQuery ? <button type="button" onClick={draf} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-white border border-[#D7DEE3] text-[#334652] hover:bg-[#F4F9FA]">{disalin ? "Tersalin ✓" : "Salin draf query ke DPJP"}</button> : null}
+          <p className="text-[10px] text-[#94A3AC]">Kode hanya ditambah bila kondisi ditegakkan DPJP dan tertulis di rekam medis; menambah diagnosis tanpa dasar klinis untuk menaikkan tarif termasuk kecurangan (upcoding) menurut Permenkes 16/2019.</p>
+        </div>)}
+    </div>
+  );
+}
+
 function LembarKodingEklaim({ claim }) {
   const [tersalin, setTersalin] = useState("");
   const [versi, setVersi] = useState("klaim");
@@ -9958,6 +10367,7 @@ function LembarKodingEklaim({ claim }) {
 
 function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfirmSeparate, onUpdateClaim }) {
   const loading = claim.aiStatus === "loading";
+  const [formPelayanan, setFormPelayanan] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editForm, setEditForm] = useState(null);
 
@@ -10012,6 +10422,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
             <h3 style={{ fontFamily: "'Space Grotesk',sans-serif" }} className="text-base font-semibold text-[#0F2A3D]">{claim.namaPasien || "Klaim"} — {claim.inacbgCode || "(kode INA-CBG belum diisi)"}</h3>
           </div>
           <div className="flex items-center gap-1">
+            {!editing && !formPelayanan && dalamPerawatan(claim) && <button onClick={() => setFormPelayanan(true)} className="mr-1 inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-[#1E6B4C] text-white">🏁 Pasien Pulang</button>}
             {!editing && <button onClick={startEdit} title="Lengkapi/ubah kode INA-CBG, kelas rawat, severity, tarif" className="p-1.5 rounded-lg hover:bg-[#F0F3F5] text-[#5B6B76]"><Pencil size={18} /></button>}
             <ToggleSamar ringkas />
             <button onClick={() => printClaims([claim])} title="Cetak berkas" className="p-1.5 rounded-lg hover:bg-[#F0F3F5] text-[#5B6B76]"><Printer size={18} /></button>
@@ -10019,6 +10430,12 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
           </div>
         </div>
 
+        {dalamPerawatan(claim) && !formPelayanan && (
+          <div className="px-5 py-2.5 bg-[#EAF4F6] border-b border-[#CFE4E8] text-xs text-[#0B5568] flex flex-wrap items-center gap-2">
+            <span>⏳ <b>Dalam perawatan</b>{claim.asalMasuk ? ` · masuk dari ${claim.asalMasuk}` : ""} · sejak {_fmtWaktu(claim.tglMasuk)} — skrining sementara.</span>
+            <button onClick={() => setFormPelayanan(true)} className="underline font-semibold">Perbarui diagnosis kerja</button>
+          </div>)}
+        {formPelayanan && <FormPelayanan claim={claim} onBatal={() => setFormPelayanan(false)} onSimpan={(patch) => { onUpdateClaim(claim.id, patch); setFormPelayanan(false); }} />}
         {editing && editForm && (
           <div className="p-5 border-b border-[#E2E8ED] bg-[#F7FAFB] space-y-3">
             <p className="text-sm font-semibold text-[#0F2A3D]">Lengkapi / ubah data klaim</p>
@@ -10117,6 +10534,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
           </div>
 
           <LembarKodingEklaim claim={claim} />
+          <RincianSeverity claim={claim} />
 
           <div>
             <p className="text-sm font-semibold text-[#0F2A3D] mb-3">Tahapan Verifikasi — pola pikir digital Vedika BPJS</p>
@@ -10160,7 +10578,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
           )}
 
           {!claim.inacbgCode && claim.primaryDxDesc && (() => {
-            const candidates = findCandidateInacbgCodes(claim.primaryDxDesc, 4);
+            const candidates = findCandidateInacbgCodes(claim.primaryDxDesc, 4, jenisDariKlaim(claim));
             if (candidates.length === 0) return null;
             return (
               <div className="bg-[#FBF8F0] border border-[#F0E6C8] rounded-lg p-3.5">
@@ -10259,6 +10677,11 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
                   : "Menunggu giliran dianalisis otomatis oleh AI (klaim risiko Sedang/Tinggi/Belum Lengkap diproses otomatis sebagai bagian dari skrining)."}
               </p>
             )}
+          </div>
+
+          <div className="border-t border-[#E2E8ED] pt-4 space-y-4">
+            <RiwayatPelayananEpisode claim={claim} />
+            <RiwayatPasienPanel claims={allClaims} noRM={claim.noRM} kecualiId={claim.id} tglAcuan={claim.tglMasuk || ""} />
           </div>
 
           <div className="border-t border-[#E2E8ED] pt-4 pb-1">
@@ -10424,7 +10847,7 @@ function Dashboard({ claims, onSelect, onDelete, onDeleteAll }) {
                 <tr key={c.id} onClick={() => onSelect(c)} className={`border-b border-[#F0F3F5] hover:bg-[#F7FAFB] cursor-pointer ${pilih.has(c.id) ? "bg-[#F4F9FA]" : ""}`}>
                   <td className="py-2.5 pr-2" onClick={(e) => e.stopPropagation()}><input type="checkbox" aria-label={`Pilih klaim ${c.noRM}`} className="w-4 h-4 accent-[#0B7285] cursor-pointer" checked={pilih.has(c.id)} onChange={() => togglePilih(c.id)} /></td>
                   <td className="py-2.5 pr-4 font-mono">{c.noRM}</td>
-                  <td className="py-2.5 pr-4">{c.namaPasien || "—"}</td>
+                  <td className="py-2.5 pr-4">{c.namaPasien || "—"}{dalamPerawatan(c) && <span className="ml-1.5 inline-block text-[10px] font-semibold text-[#0B5568] bg-[#EAF4F6] border border-[#CFE4E8] rounded-full px-1.5 py-0.5 whitespace-nowrap">⏳ Dirawat{c.asalMasuk ? ` · ${c.asalMasuk}` : ""}</span>}</td>
                   <td className="py-2.5 pr-4">{c.dpjp || "—"}</td>
                   <td className="py-2.5 pr-4 font-mono">{c.inacbgCode}</td>
                   <td className="py-2.5 pr-4">{c.severityLevel}</td>
@@ -11006,6 +11429,7 @@ export default function App() {
   const claims = useMemo(() => screenAllClaims(rawClaims, weights), [rawClaims, weights]);
   const [fBulan, setFBulan] = useState("");
   const [fDpjp, setFDpjp] = useState("");
+  const [fStatus, setFStatus] = useState("");
   const opsiFilter = useMemo(() => {
     const bl = new Set(), dp = new Map();
     const tambahDp = (v) => { const k = _kunciDpjp(v); if (k && !dp.has(k)) dp.set(k, String(v).trim()); };
@@ -11013,8 +11437,10 @@ export default function App() {
     if (adminRS() && BIAYA_RS && BIAYA_RS.kubus) { BIAYA_RS.kubus.bulan.forEach((b) => bl.add(b)); BIAYA_RS.kubus.dpjp.forEach((d) => d !== "-" && tambahDp(d)); }
     return { bulan: [...bl].sort().reverse(), dpjp: [...dp.entries()].sort((a, b) => a[1].localeCompare(b[1])) };
   }, [claims, tab]);
-  const claimsF = useMemo(() => (!fBulan && !fDpjp) ? claims
-    : claims.filter((c) => (!fBulan || _bulanKlaim(c) === fBulan) && (!fDpjp || _kunciDpjp(c.dpjp) === fDpjp)), [claims, fBulan, fDpjp]);
+  const claimsF = useMemo(() => (!fBulan && !fDpjp && !fStatus) ? claims
+    : claims.filter((c) => (!fBulan || _bulanKlaim(c) === fBulan) && (!fDpjp || _kunciDpjp(c.dpjp) === fDpjp)
+      && (!fStatus || (fStatus === "dirawat" ? dalamPerawatan(c) : !dalamPerawatan(c)))), [claims, fBulan, fDpjp, fStatus]);
+  const jmlDirawat = useMemo(() => claims.filter(dalamPerawatan).length, [claims]);
 
   // Jalankan opini AI untuk sebuah klaim dan simpan hasilnya kembali ke data mentah —
   // ini membuat analisis AI menjadi bagian permanen dari data klaim (bukan hasil sementara).
@@ -11200,11 +11626,14 @@ export default function App() {
               <option value="">Semua DPJP</option>
               {opsiFilter.dpjp.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
             </select>
-            {(fBulan || fDpjp) && <button onClick={() => { setFBulan(""); setFDpjp(""); }} className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-[#D7DEE3] text-[#334652] bg-white"><X size={12} /> Hapus filter</button>}
-            {tab !== "biaya" && <span className="text-xs text-[#94A3AC] ml-auto">{(fBulan || fDpjp) ? `${claimsF.length.toLocaleString("id-ID")} dari ${claims.length.toLocaleString("id-ID")} klaim` : "Bulan = tanggal keluar (pulang)"}</span>}
+            {tab !== "biaya" && <select aria-label="Filter status pelayanan" value={fStatus} onChange={(e) => setFStatus(e.target.value)} className="rounded-lg border border-[#D7DEE3] px-2 py-1.5 text-sm bg-white">
+              <option value="">Semua status</option><option value="dirawat">⏳ Dalam perawatan ({jmlDirawat})</option><option value="pulang">Sudah pulang</option>
+            </select>}
+            {(fBulan || fDpjp || fStatus) && <button onClick={() => { setFBulan(""); setFDpjp(""); setFStatus(""); }} className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-[#D7DEE3] text-[#334652] bg-white"><X size={12} /> Hapus filter</button>}
+            {tab !== "biaya" && <span className="text-xs text-[#94A3AC] ml-auto">{(fBulan || fDpjp || fStatus) ? `${claimsF.length.toLocaleString("id-ID")} dari ${claims.length.toLocaleString("id-ID")} klaim` : "Bulan = tanggal keluar (pulang)"}</span>}
           </div>)}
-        {tab === "dashboard" && loaded && <Dashboard claims={claimsF} onSelect={setSelected} onDelete={deleteClaim} onDeleteAll={adminRS() && !fBulan && !fDpjp ? deleteAllClaims : null} />}
-        {tab === "input" && <InputManual onAdd={addClaim} />}
+        {tab === "dashboard" && loaded && <Dashboard claims={claimsF} onSelect={setSelected} onDelete={deleteClaim} onDeleteAll={adminRS() && !fBulan && !fDpjp && !fStatus ? deleteAllClaims : null} />}
+        {tab === "input" && <InputManual onAdd={addClaim} claims={claims} />}
         {tab === "batch" && <BatchUpload onAddMany={addMany} onDone={() => setTab("dashboard")} />}
         {tab === "dpjp" && <DpjpPattern claims={claimsF} />}
         {tab === "kajian" && <KajianInkonsistensi claims={claimsF} onSelect={setSelected} />}
