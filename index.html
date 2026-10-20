@@ -5655,6 +5655,8 @@ async function muatRiwayatRS() {
   PENDING_RS = null; IDRG_RS = null;
   if (!supabase || !PROFIL) return;
   GROUPER_RS = null;
+  FORMULARIUM_RS = null;
+  { const f = await supabase.from("riwayat_rs").select("formularium").eq("rs_id", PROFIL.rs.id).maybeSingle(); if (!f.error && f.data && f.data.formularium && f.data.formularium.baris) FORMULARIUM_RS = f.data.formularium; }
   let { data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah, pending, idrg, grouper").eq("rs_id", PROFIL.rs.id).maybeSingle();
   if (!error && data) GROUPER_RS = data.grouper && data.grouper.ri ? data.grouper : null;
   if (error) ({ data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah, pending, idrg").eq("rs_id", PROFIL.rs.id).maybeSingle());
@@ -7219,6 +7221,81 @@ const TERAPI_PENDUKUNG = [
   [/^E86/, "dehidrasi", "rehidrasi", "dehidrasi tanpa rehidrasi tercatat"],
 ];
 const LABEL_TERAPI = { antibiotik: "antibiotik", oat: "OAT", antidiabetik: "antidiabetik (OAD/insulin)", antihipertensi: "antihipertensi", diuretik: "diuretik", oksigen: "terapi oksigen/ventilasi", vasopresor: "vasopresor/inotropik atau resusitasi cairan", mgso4: "MgSO4", antikonvulsan: "antikonvulsan", gizi: "terapi gizi (F75/F100/diet/konsul gizi)", anemia: "transfusi/PRC atau terapi besi/asam folat/EPO", natrium: "koreksi natrium (NaCl 3%/hipertonik)", kalium: "koreksi kalium (KCl/KSR)", rehidrasi: "rehidrasi (infus/oralit)" };
+// ---- v11: FORMULARIUM RS ----
+// FORMULARIUM_RS = { sumber, jumlah, baris: [[kelas, sub_kelas, generik, sediaan, "F"/"NF"/"", nama_rs, nama_dagang]] }
+let FORMULARIUM_RS = null;
+const KELOMPOK_FORMULARIUM = {
+  // kelompok terapi v10 → pola sub-kelas / kelas / generik di formularium
+  antibiotik: { sub: /^(antibakteri|antibakteri lain|antiseptik saluran kemih)$/i, kelas: /antiinfeksi/i },
+  oat: { sub: /antituberkulosis|antilepra/i },
+  antidiabetik: { sub: /antidiabetes/i },
+  antihipertensi: { sub: /^antihipertensi$/i },
+  diuretik: { sub: /^diuretik$|gagal jantung/i },
+  vasopresor: { sub: /syok kardiogenik|sepsis/i },
+  antikonvulsan: { kelas: /antiepilepsi|antikonvulsi/i },
+  anemia: { sub: /antianemi/i },
+  mgso4: { generik: /magnesium\s*sulfat/i },
+  kalium: { generik: /kalium\s*(aspartat|klorida|L-aspartat)/i },
+  rehidrasi: { kelas: /larutan elektrolit/i, sub: /^(oral|parenteral)$/i },
+  oksigen: { generik: /^oksigen$/i },
+};
+const _KATA_UMUM = /^(tab|tablet|kaps|kapsul|inj|injeksi|sir|sirup|syr|drop|tts|krim|salep|gel|supp|serb|vial|amp|infus|larutan|lar|kombinasi|generik|dll|mg|ml|iu|forte|plus|rapid|kid|anak|dewasa)$/i;
+function _namaObat(b) {
+  // generik (tanpa dosis) + nama generik RS + nama dagang → token nama obat (huruf kecil, ≥4 huruf)
+  const raw = [b[2], b[5], b[6]].join(" / ");
+  return [...new Set(raw.split(/[\/,;+()]|\s{2,}/).map((x) => x.replace(/\d[\d.,]*\s*(mg|mcg|g|ml|iu|%|mEq)?/gi, "").replace(/\b(tab|tablet|inj|sir|sirup|kaps|drop|infus|vial|amp|serb)\b/gi, "").replace(/\s+/g, " ").trim().toLowerCase())
+    .filter((x) => x.length >= 4 && !_KATA_UMUM.test(x) && /[a-z]/.test(x)))];
+}
+function _escRe2(x) { return x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function infoFormularium() {
+  const F = FORMULARIUM_RS;
+  if (!F || !Array.isArray(F.baris) || !F.baris.length) return null;
+  if (F._info) return F._info;
+  const kel = {};
+  Object.entries(KELOMPOK_FORMULARIUM).forEach(([k, p]) => {
+    const baris = F.baris.filter((b) => (!p.kelas || p.kelas.test(b[0] || "")) && (!p.sub || p.sub.test(b[1] || "")) && (!p.generik || p.generik.test(b[2] || "")) && (p.kelas || p.sub || p.generik));
+    const nama = [...new Set(baris.flatMap(_namaObat))];
+    const generik = {};
+    baris.forEach((b) => { const g = String(b[2] || "").replace(/\s+/g, " ").trim(); if (!g || g.length > 60) return; generik[g] = generik[g] || new Set(); if (b[4]) generik[g].add(b[4]); });
+    kel[k] = { re: nama.length ? new RegExp(`(^|[^a-z])(${nama.map(_escRe2).join("|")})(?![a-z])`, "i") : null,
+      pilihan: Object.entries(generik).slice(0, 10).map(([g, st]) => `${g}${st.size ? ` (${[...st].join("/")})` : ""}`) };
+  });
+  // obat non-Fornas: nama yang HANYA muncul pada baris berstatus NF
+  // obat non-Fornas: NAMA DAGANG dari baris NF, yang generiknya tidak punya sediaan F sama sekali
+  // dan namanya tidak muncul di baris F mana pun (hindari salah tanda pada obat umum spt parasetamol)
+  const genF = new Set(F.baris.filter((b) => b[4] === "F").map((b) => String(b[2] || "").toLowerCase().trim()));
+  const tokF = new Set(F.baris.filter((b) => b[4] !== "NF").flatMap(_namaObat));
+  const nf = [...new Set(F.baris.filter((b) => b[4] === "NF" && b[6] && !genF.has(String(b[2] || "").toLowerCase().trim()))
+    .flatMap((b) => _namaObat(["", "", "", "", "", "", b[6]])))].filter((n) => n.length >= 5 && !tokF.has(n) && !/^(sanmol|pamol|paracetamol|parasetamol)/.test(n));
+  const reNF = nf.length ? new RegExp(`(^|[^a-z])(${nf.map(_escRe2).join("|")})(?![a-z])`, "gi") : null;
+  Object.defineProperty(F, "_info", { value: { kel, reNF }, enumerable: false });
+  return F._info;
+}
+function obatTercatat(kelompok, teks) {
+  if (OBAT_RE[kelompok] && OBAT_RE[kelompok].test(teks)) return true;
+  const inf = infoFormularium();
+  return !!(inf && inf.kel[kelompok] && inf.kel[kelompok].re && inf.kel[kelompok].re.test(teks));
+}
+function pilihanFormularium(kelompok) {
+  const inf = infoFormularium();
+  return inf && inf.kel[kelompok] ? inf.kel[kelompok].pilihan : [];
+}
+function obatNonFornasDiResume(teks) {
+  const inf = infoFormularium();
+  if (!inf || !inf.reNF || !teks) return [];
+  const out = new Set(); let m; inf.reNF.lastIndex = 0;
+  while ((m = inf.reNF.exec(teks)) !== null) out.add(m[2].toLowerCase());
+  return [...out];
+}
+// Formularium dari Excel: kolom kelas_terapi, sub_kelas_terapi, nama_generik, sediaan, fornas (F/NF), nama_generik_rs, nama_dagang
+function bangunFormulariumDariExcel(rows) {
+  const k = (r, ...n) => _kunciKolom(r, ...n);
+  const baris = rows.map((r) => [k(r, "kelas_terapi", "kelas"), k(r, "sub_kelas_terapi", "sub_kelas", "subkelas"), k(r, "nama_generik", "generik"), k(r, "sediaan"), k(r, "fornas", "f/nf", "status"), k(r, "nama_generik_rs", "nama_rs"), k(r, "nama_dagang", "dagang", "merek")]
+    .map((v) => String(v ?? "").trim())).filter((b) => b[2] || b[5] || b[6]);
+  baris.forEach((b) => { b[4] = /^nf$|non/i.test(b[4]) ? "NF" : /^f$|fornas/i.test(b[4]) ? "F" : ""; });
+  return { jumlah: baris.length, baris };
+}
+
 function validasiTerapi(claim) {
   const hasil = [];
   const du = String(claim.primaryDxCode || "").trim().toUpperCase();
@@ -7230,16 +7307,16 @@ function validasiTerapi(claim) {
   }
   // B. Diagnosis yang dikode tetapi terapi pendukungnya tidak tercatat di resume
   const teks = String(claim.resumeMedis || "");
-  const adaBagianTerapi = teks.length >= 120 && Object.values(OBAT_RE).some((re) => re.test(teks));
+  const adaBagianTerapi = teks.length >= 120 && Object.keys(OBAT_RE).some((k) => obatTercatat(k, teks));
   if (!adaBagianTerapi) return hasil;   // resume tidak memuat terapi sama sekali → tidak dinilai (hindari alarm palsu)
   const kurang = [];
   [du, ...sek].forEach((kode, i) => {
     const r = TERAPI_PENDUKUNG.find(([re]) => re.test(kode));
     if (!r || kurang.some((k) => k.kode === kode)) return;
-    if (!OBAT_RE[r[2]].test(teks)) kurang.push({ kode, kondisi: r[1], terapi: LABEL_TERAPI[r[2]], contoh: r[3], peran: i === 0 ? "diagnosis utama" : "diagnosis sekunder" });
+    if (!obatTercatat(r[2], teks)) kurang.push({ kode, kondisi: r[1], terapi: LABEL_TERAPI[r[2]], contoh: r[3], peran: i === 0 ? "diagnosis utama" : "diagnosis sekunder", pilihan: pilihanFormularium(r[2]) });
   });
   if (kurang.length) {
-    hasil.push({ id: "terapiTidakTercatat", detail: kurang.map((k) => `${k.kode} (${k.kondisi}, ${k.peran}) dikode tetapi ${k.terapi} tidak tercatat di resume — contoh alasan pending nyata: "${k.contoh}"`).join("; ") + `. Verifikator BPJS menilai diagnosis dari klinis + penunjang + TATALAKSANA; tanpa terapi yang tercatat, diagnosis sekunder rawan dihapus (severity turun) dan diagnosis utama rawan dikoreksi. Lengkapi catatan terapi di resume/CPPT bila memang diberikan, atau konfirmasi ke DPJP. Ini pemeriksaan kelengkapan dokumentasi, BUKAN rekomendasi resep.` });
+    hasil.push({ id: "terapiTidakTercatat", detail: kurang.map((k) => `${k.kode} (${k.kondisi}, ${k.peran}) dikode tetapi ${k.terapi} tidak tercatat di resume — contoh alasan pending nyata: "${k.contoh}"${k.pilihan.length ? `. Rujukan Formularium RS untuk kelompok ini: ${k.pilihan.join(", ")}` : ""}`).join("; ") + `. Verifikator BPJS menilai diagnosis dari klinis + penunjang + TATALAKSANA; tanpa terapi yang tercatat, diagnosis sekunder rawan dihapus (severity turun) dan diagnosis utama rawan dikoreksi. Lengkapi catatan terapi di resume/CPPT bila memang diberikan, atau konfirmasi ke DPJP. Ini pemeriksaan kelengkapan dokumentasi, BUKAN rekomendasi resep.` });
   }
   return hasil;
 }
@@ -7715,6 +7792,11 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   validasiKlinisDeterministik(claim).forEach((v) => add(v.id, v.detail));
   // 9l. v10: kesesuaian diagnosis ↔ terapi yang tercatat (dari alasan pending nyata)
   validasiTerapi(claim).forEach((v) => add(v.id, v.detail));
+  // v11: obat non-Fornas yang tercatat di resume — catatan kendali biaya (tidak menambah skor)
+  {
+    const nf = obatNonFornasDiResume(claim.resumeMedis);
+    if (nf.length) notes.push({ id: "obatNonFornas", label: `Obat non-Fornas tercatat di resume (${nf.length})`, detail: `Menurut Formularium RS, obat berikut berstatus NF (non-Formularium Nasional): ${nf.join(", ")}. Biaya obat termasuk dalam paket INA-CBG — pastikan penggunaannya sesuai kebijakan formularium RS (Peraturan Direktur tentang penggunaan obat formularium) dan ada justifikasi klinis bila ada alternatif Fornas.` });
+  }
 
   // 9m. Aturan dari ALASAN PENDING NYATA Agustus 2026 (124 kasus, dicocokkan per SEP ke
   //     6.851 klaim e-Klaim Agustus). Angka "n/pending" di komentar = berapa klaim
@@ -7906,6 +7988,8 @@ function konteksPendingIdrgAI(claim) {
   if (relevan.length) t += `\n- Preseden pending BPJS ${pp.acuan ? "(pola acuan RS rujukan)" : "di RS ini"}${pp.periode ? " " + pp.periode : ""} untuk klaim serupa: ${relevan.map((h) => `${labelKunciPending(h)} — ${h.p}/${h.n} klaim dipending (${Math.round(h.rate * 100)}%); alasan verifikator: ${h.alasan.map(([x, j]) => `"${x}" (${j}x)`).join("; ")}`).join(" | ")}. GUNAKAN untuk memeriksa apakah dokumentasi klaim ini sudah menjawab alasan-alasan tersebut dan sebutkan di "Area yang Perlu Diverifikasi" bila belum — BUKAN alasan menaikkan/menurunkan kode tanpa bukti tertulis.`;
   const dx = [claim.primaryDxCode, ...(claim.secondaryDx || []).map((d) => d.code)].map((x) => String(x || "").trim().toUpperCase()).filter(Boolean);
   const rirj = claim.jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
+  const tvAI = validasiTerapi(claim).find((v) => v.id === "terapiTidakTercatat");
+  if (tvAI) t += `\n- Pemeriksaan terapi otomatis: ${tvAI.detail.split(". Verifikator")[0]}. Sebutkan di "Area yang Perlu Diverifikasi" (konfirmasi DPJP apakah terapi diberikan tetapi belum tercatat). JANGAN menyarankan resep/dosis — rujukan formularium hanya untuk konfirmasi dokumentasi.`;
   const pxAI = (claim.procedures || []).map((p) => String(p.code || "").trim()).filter(Boolean);
   const pgAI = prediksiInacbg(dx, pxAI, rirj);
   if (pgAI) t += `\n- Prediksi kode INA-CBG menurut model grouper ${pgAI.acuan ? "acuan" : "RS ini"} (uji mundur 98,7% tepat; ${pgAI.jml}x preseden, dari ${pgAI.cara}): ${pgAI.kode}${TARIF_REF_MAP[pgAI.kode] ? ` "${TARIF_REF_MAP[pgAI.kode][1]}"` : ""}${pgAI.penentu.length ? `; diagnosis sekunder penentu severity: ${pgAI.penentu.map(([c, v]) => `${c} (→${["I", "II", "III"][v - 1]})`).join(", ")}` : ""}${claim.inacbgCode && String(claim.inacbgCode).trim().toUpperCase() !== pgAI.kode ? ` — BERBEDA dengan kode klaim ${claim.inacbgCode}; telaah penyebabnya (input diagnosis/tindakan atau dokumentasi CC)` : ""}.`;
@@ -11224,7 +11308,7 @@ function PortalAdminRS() {
   const [sub, setSub] = useState("pengguna");
   return (
     <div>
-      <SubTab aktif={sub} onPilih={setSub} pilihan={[{ id: "pengguna", label: "Pengguna" }, { id: "pola", label: "Pola Pending RS" }, { id: "ppk", label: "PPK RS" }, { id: "tarif", label: "Tabel Tarif" }, { id: "riwayat", label: "Riwayat Grouping" }]} />
+      <SubTab aktif={sub} onPilih={setSub} pilihan={[{ id: "pengguna", label: "Pengguna" }, { id: "pola", label: "Pola Pending RS" }, { id: "ppk", label: "PPK RS" }, { id: "tarif", label: "Tabel Tarif" }, { id: "riwayat", label: "Riwayat Grouping" }, { id: "formularium", label: "Formularium" }]} />
       {sub === "pengguna" && <KelolaPengguna rsId={PROFIL.rs.id} rsNama={PROFIL.rs.nama} />}
       {sub === "pola" && (
         <div>
@@ -11239,6 +11323,7 @@ function PortalAdminRS() {
       )}
       {sub === "tarif" && <PanelTarifRS />}
       {sub === "riwayat" && <PanelRiwayatGrouping />}
+      {sub === "formularium" && <PanelFormularium />}
     </div>
   );
 }
@@ -11494,6 +11579,59 @@ async function bacaSemuaBaris(files, syarat) {
   }
   return out;
 }
+function PanelFormularium() {
+  const [file, setFile] = useState(null);
+  const [sumber, setSumber] = useState((FORMULARIUM_RS && FORMULARIUM_RS.sumber) || "");
+  const [proses, setProses] = useState("");
+  const [cari, setCari] = useState("");
+  const [, segarkan] = useState(0);
+  const [kabarEl, kabar] = useKabar();
+  const unggah = async (e) => {
+    e.preventDefault();
+    if (!file) { kabar(false, "Pilih file Excel formularium dulu."); return; }
+    try {
+      setProses("Membaca file...");
+      const rows = await bacaSemuaBaris([file], (r) => _kunciKolom(r, "nama_generik", "generik") !== undefined);
+      if (!rows.length) throw new Error("Kolom nama_generik tidak ditemukan. Gunakan template: kelas_terapi, sub_kelas_terapi, nama_generik, sediaan, fornas, nama_generik_rs, nama_dagang.");
+      const f = { ...bangunFormulariumDariExcel(rows), sumber: sumber || file.name, diubah: new Date().toISOString() };
+      setProses("Menyimpan...");
+      const { error } = await supabase.from("riwayat_rs").upsert({ rs_id: PROFIL.rs.id, formularium: f }, { onConflict: "rs_id" });
+      if (error) throw new Error(/formularium/.test(error.message) ? "Database belum diperbarui — jalankan SQL 10 dulu. (" + error.message + ")" : error.message);
+      FORMULARIUM_RS = f; segarkan((x) => x + 1);
+      kabar(true, `Formularium tersimpan: ${f.jumlah.toLocaleString("id-ID")} baris obat. Langsung dipakai untuk cek terapi & rujukan.`);
+      setFile(null);
+    } catch (err) { kabar(false, err.message); }
+    setProses("");
+  };
+  const unduhTemplate = () => {
+    const ws = XLSX.utils.aoa_to_sheet([["kelas_terapi", "sub_kelas_terapi", "nama_generik", "sediaan", "fornas", "nama_generik_rs", "nama_dagang"], ["ANTIINFEKSI", "ANTIBAKTERI", "seftriakson", "serb inj 1.000 mg/vial", "F", "ceftriaxone", "broadced"]]);
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "formularium"); XLSX.writeFile(wb, "template_formularium_rs.xlsx");
+  };
+  const F = FORMULARIUM_RS;
+  const tampil = F ? F.baris.filter((b) => !cari.trim() || b.join(" ").toLowerCase().includes(cari.trim().toLowerCase())).slice(0, 200) : [];
+  const inf = infoFormularium();
+  return (
+    <Section title="Formularium RS" subtitle="Dipakai untuk mengenali obat di resume (nama generik & dagang), rujukan pilihan obat per kelompok terapi, dan catatan obat non-Fornas — bukan untuk meresepkan">
+      {kabarEl}
+      <p className="text-sm text-[#334652] mb-2">Saat ini: {F ? <b>{F.jumlah.toLocaleString("id-ID")} baris obat{F.sumber ? " · " + F.sumber : ""}</b> : <b>belum ada formularium</b>}{inf ? ` · ${Object.values(inf.kel).filter((x) => x.re).length} kelompok terapi dikenali` : ""}</p>
+      <form onSubmit={unggah} className="flex flex-wrap gap-2 items-end mb-3">
+        <div><label className="block text-xs text-[#5B6B76] mb-1">File Excel formularium</label><input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => setFile(e.target.files[0] || null)} className="text-xs" /></div>
+        <div className="flex-1 min-w-[200px]"><label className="block text-xs text-[#5B6B76] mb-1">Sumber / nomor SK</label><input value={sumber} onChange={(e) => setSumber(e.target.value)} placeholder="mis. Formularium RS 2026, Perdir No. ..." className={KELAS_INPUT} /></div>
+        <button type="submit" disabled={!!proses} className={TOMBOL_UTAMA}>{proses ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />} {proses || "Unggah & simpan"}</button>
+        <button type="button" onClick={unduhTemplate} className={TOMBOL_KEDUA}><Download size={12} /> Template Excel</button>
+      </form>
+      {F && <>
+        <input value={cari} onChange={(e) => setCari(e.target.value)} placeholder="Cari nama obat / kelas terapi..." className={KELAS_INPUT + " mb-2"} />
+        <div className="overflow-x-auto max-h-96 overflow-y-auto border border-[#E2E8ED] rounded-lg">
+          <table className="w-full text-xs"><thead className="bg-[#F4F9FA] sticky top-0"><tr>{["Kelas", "Sub kelas", "Generik", "Sediaan", "F/NF", "Nama RS", "Nama dagang"].map((h) => <th key={h} className="text-left px-2 py-1.5 font-semibold text-[#334652]">{h}</th>)}</tr></thead>
+            <tbody>{tampil.map((b, i) => <tr key={i} className="border-t border-[#F0F3F5]">{b.map((v, j) => <td key={j} className={`px-2 py-1 ${j === 4 && v === "NF" ? "text-[#9A6300] font-semibold" : "text-[#334652]"}`}>{v}</td>)}</tr>)}</tbody></table>
+        </div>
+        <p className="text-[11px] text-[#94A3AC] mt-1">Menampilkan {tampil.length} dari {F.jumlah} baris. F = Formularium Nasional, NF = non-Fornas.</p>
+      </>}
+    </Section>
+  );
+}
+
 function PanelRiwayatGrouping() {
   const [file, setFile] = useState(null);
   const [filePending, setFilePending] = useState(null);
