@@ -6118,7 +6118,15 @@ function bangunProfilBiaya(norm) {
   norm.forEach((c) => { if (c.ptd !== "RI" || !c.biaya || !c.biaya.billing || !c.biaya.dpjp || !(c.kode in rerata)) return;
     const d = (dp[c.biaya.dpjp] = dp[c.biaya.dpjp] || [c.biaya.dpjp, 0, 0, 0, 0]); d[1]++; d[2] += c.biaya.obat; d[3] += rerata[c.kode]; d[4] += c.biaya.billing - c.biaya.tarif; });
   const dpjp = Object.values(dp).filter((d) => d[1] >= 30).map((d) => [d[0], d[1], Math.round(d[2]), Math.round(d[3]), Math.round(d[4])]).sort((a, b) => b[2] / b[3] - a[2] / a[3]);
-  return { jumlah: norm.length, kode, bulan, dpjp };
+  // kubus untuk filter bulan & DPJP: baris [iBulan, iDpjp, iKode, RI?1:0, klaim, klaim billing>tarif, tarif, billing, obat]
+  const kubus = { bulan: [], dpjp: [], kode: [], baris: [] }, ix = { bulan: {}, dpjp: {}, kode: {} }, sel = {};
+  const id = (dim, v) => (ix[dim][v] !== undefined ? ix[dim][v] : (ix[dim][v] = kubus[dim].push(v) - 1));
+  norm.forEach((c) => { if (!c.biaya || !c.biaya.billing || !c.bulan || !c.kode) return;
+    const kunci = [id("bulan", c.bulan), id("dpjp", c.biaya.dpjp || "-"), id("kode", c.kode), c.ptd === "RI" ? 1 : 0];
+    const r = (sel[kunci.join(",")] = sel[kunci.join(",")] || [...kunci, 0, 0, 0, 0, 0]);
+    r[4]++; if (c.biaya.tarif < c.biaya.billing) r[5]++; r[6] += c.biaya.tarif; r[7] += c.biaya.billing; r[8] += c.biaya.obat; });
+  kubus.baris = Object.values(sel).map((r) => r.map((v) => Math.round(v)));
+  return { jumlah: norm.length, kode, bulan, dpjp, kubus };
 }
 function profilBiaya(kode) {
   const r = BIAYA_RS && BIAYA_RS.kode ? BIAYA_RS.kode[String(kode || "").trim().toUpperCase()] : null;
@@ -10652,25 +10660,60 @@ const _pct = (a, b) => (b ? (a / b * 100).toLocaleString("id-ID", { maximumFract
 const _NAMA_BLN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const _bln = (b) => { const m = String(b).match(/^(\d{4})-(\d{2})$/); return m ? `${_NAMA_BLN[Number(m[2]) - 1]} ${m[1]}` : b; };
 const _jenisKode = (k) => (/^[A-Z]-[146]-/.test(k) ? "RI" : "RJ");
+// v14: filter bersama — nama DPJP dibandingkan tanpa tanda baca/kapital ("dr. Gigih F., Sp.PD" = "DR. GIGIH F SP.PD")
+const _kunciDpjp = (v) => String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const _bulanKlaim = (c) => { const t = String(c.tglKeluar || c.tglMasuk || ""); return /^\d{4}-\d{2}/.test(t) ? t.slice(0, 7) : ""; };
 
-function PanelBiayaObat() {
+function PanelBiayaObat({ fBulan = "", fDpjp = "" }) {
   const B = BIAYA_RS;
+  const K = B && B.kubus;
+  const filterAktif = !!(fBulan || fDpjp);
+  const agg = useMemo(() => {
+    if (!K || !K.baris) return null;
+    const rer = {};
+    K.baris.forEach((r) => { const a = (rer[r[2]] = rer[r[2]] || [0, 0]); a[0] += r[4]; a[1] += r[8]; });
+    const bl = {}, kd = {}, dp = {};
+    K.baris.forEach(([bi, di, ki, ri, n, rugi, t, b, o]) => {
+      if (fBulan && K.bulan[bi] !== fBulan) return;
+      if (fDpjp && _kunciDpjp(K.dpjp[di]) !== fDpjp) return;
+      const j = ri ? "RI" : "RJ";
+      const x = (bl[bi + j] = bl[bi + j] || { bulan: K.bulan[bi], jenis: j, n: 0, tarif: 0, billing: 0, obat: 0 }); x.n += n; x.tarif += t; x.billing += b; x.obat += o;
+      const y = (kd[ki] = kd[ki] || { kode: K.kode[ki], n: 0, rugiN: 0, tarif: 0, billing: 0, obat: 0 }); y.n += n; y.rugiN += rugi; y.tarif += t; y.billing += b; y.obat += o;
+      if (ri && K.dpjp[di] !== "-") { const z = (dp[di] = dp[di] || [K.dpjp[di], 0, 0, 0, 0]); z[1] += n; z[2] += o; z[3] += n * rer[ki][1] / rer[ki][0]; z[4] += b - t; }
+    });
+    const minDp = fDpjp ? 1 : fBulan ? 5 : 30;
+    return {
+      bulan: Object.values(bl).sort((a, b) => (a.bulan + a.jenis).localeCompare(b.bulan + b.jenis)),
+      kode: Object.values(kd),
+      dpjp: Object.values(dp).filter((d) => d[1] >= minDp).map((d) => [d[0], d[1], Math.round(d[2]), Math.round(d[3]), Math.round(d[4])]).sort((a, b) => b[2] / b[3] - a[2] / a[3]),
+      minDp,
+    };
+  }, [K, fBulan, fDpjp]);
   const [jenis, setJenis] = useState("RI");
   const [cari, setCari] = useState("");
   const [urut, setUrut] = useState("selisih");
   const [naik, setNaik] = useState(true);
   const kodeRows = useMemo(() => {
     if (!B || !B.kode) return [];
+    if (agg && filterAktif) return agg.kode.map((r) => {
+      const info = TARIF_REF_RAW.find((t) => t[0] === r.kode);
+      return { kode: r.kode, jenis: _jenisKode(r.kode), desk: info ? info[1] || "" : "", n: r.n, medTarif: r.tarif / r.n, medBilling: r.billing / r.n, medObat: r.obat / r.n, p90: null, rugi: r.rugiN / r.n, tarif: r.tarif, billing: r.billing, obat: r.obat, selisih: r.tarif - r.billing, porsiObat: r.tarif ? r.obat / r.tarif : 0 };
+    });
     return Object.entries(B.kode).filter(([, r]) => r.length >= 9).map(([kode, r]) => {
       const info = TARIF_REF_RAW.find((t) => t[0] === kode);
       return { kode, jenis: _jenisKode(kode), desk: info ? info[1] || "" : "", n: r[0], medTarif: r[1], medBilling: r[2], medObat: r[3], p90: r[4], rugi: r[5], tarif: r[6], billing: r[7], obat: r[8], selisih: r[6] - r[7], porsiObat: r[6] ? r[8] / r[6] : 0 };
     });
-  }, [B]);
+  }, [B, agg, filterAktif]);
   if (!B || !B.kode || !B.bulan) return (
     <Section title="Biaya Obat & Selisih Klaim" subtitle="Belum ada data biaya">
       <p className="text-sm text-[#5B6B76]">Data biaya dibangun dari ekspor e-Klaim (kolom TOTAL_TARIF, TARIF_RS, OBAT). Buka <b>Admin RS → Riwayat Grouping</b>, unggah ekspor e-Klaim, lalu klik <b>Pelajari &amp; simpan</b>.</p>
     </Section>);
-  const bulan = (B.bulan || []).map((b) => ({ bulan: b[0], jenis: b[1], n: b[2], tarif: b[3], billing: b[4], obat: b[5] }));
+  if (filterAktif && !agg) return (
+    <Section title="Biaya Obat & Selisih Klaim" subtitle="Filter bulan/DPJP belum tersedia untuk data ini">
+      <p className="text-sm text-[#5B6B76]">Data biaya RS ini dibuat sebelum fitur filter. Jalankan SQL <b>11_profil_biaya.sql</b> terbaru, atau unggah ulang ekspor e-Klaim di <b>Admin RS → Riwayat Grouping</b>. Sementara itu, kosongkan filter untuk melihat ringkasan keseluruhan.</p>
+    </Section>);
+  const bulan = agg ? agg.bulan : (B.bulan || []).map((b) => ({ bulan: b[0], jenis: b[1], n: b[2], tarif: b[3], billing: b[4], obat: b[5] }));
+  const daftarDpjp = agg ? agg.dpjp : (B.dpjp || []);
   const tot = (j) => bulan.filter((b) => b.jenis === j).reduce((a, b) => ({ n: a.n + b.n, tarif: a.tarif + b.tarif, billing: a.billing + b.billing, obat: a.obat + b.obat }), { n: 0, tarif: 0, billing: 0, obat: 0 });
   const RI = tot("RI"), RJ = tot("RJ");
   const blnJ = bulan.filter((b) => b.jenis === jenis);
@@ -10679,14 +10722,16 @@ function PanelBiayaObat() {
   const q = cari.trim().toUpperCase();
   const kodeJ = kodeRows.filter((r) => r.jenis === jenis && (!q || r.kode.includes(q) || r.desk.toUpperCase().includes(q)))
     .sort((a, b) => (naik ? 1 : -1) * (a[urut] - b[urut]));
-  const kolom = [["kode", "Kode"], ["n", "Klaim"], ["selisih", "Selisih total"], ["rugi", "% billing > tarif"], ["medTarif", "Median tarif"], ["medBilling", "Median billing"], ["medObat", "Median obat"], ["porsiObat", "Obat / tarif"]];
+  const ukuran = filterAktif ? "Rata-rata" : "Median";
+  const kolom = [["kode", "Kode"], ["n", "Klaim"], ["selisih", "Selisih total"], ["rugi", "% billing > tarif"], ["medTarif", ukuran + " tarif"], ["medBilling", ukuran + " billing"], ["medObat", ukuran + " obat"], ["porsiObat", "Obat / tarif"]];
+  const labelFilter = [fBulan && _bln(fBulan), fDpjp && ((K && K.dpjp.find((d) => _kunciDpjp(d) === fDpjp)) || "DPJP terpilih")].filter(Boolean).join(" · ");
   const klikUrut = (k) => { if (k === "kode") return; if (urut === k) setNaik(!naik); else { setUrut(k); setNaik(k === "selisih"); } };
   const unduh = () => {
-    const rows = kodeRows.map((r) => ({ Kode: r.kode, Jenis: r.jenis, Deskripsi: r.desk, Klaim: r.n, "Total tarif INA-CBG": r.tarif, "Total billing RS": r.billing, "Selisih (tarif − billing)": r.selisih, "Total obat": r.obat, "Median tarif": r.medTarif, "Median billing": r.medBilling, "Median obat": r.medObat, "P90 obat": r.p90, "Porsi klaim billing > tarif": r.rugi }));
+    const rows = kodeRows.map((r) => ({ Kode: r.kode, Jenis: r.jenis, Deskripsi: r.desk, Klaim: r.n, "Total tarif INA-CBG": r.tarif, "Total billing RS": r.billing, "Selisih (tarif − billing)": r.selisih, "Total obat": r.obat, [ukuran + " tarif"]: Math.round(r.medTarif), [ukuran + " billing"]: Math.round(r.medBilling), [ukuran + " obat"]: Math.round(r.medObat), ...(filterAktif ? {} : { "P90 obat": r.p90 }), "Porsi klaim billing > tarif": r.rugi }));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Per kode INA-CBG");
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(bulan.map((b) => ({ Bulan: b.bulan, Jenis: b.jenis, Klaim: b.n, "Tarif INA-CBG": b.tarif, "Billing RS": b.billing, Obat: b.obat, Selisih: b.tarif - b.billing }))), "Per bulan");
-    XLSX.writeFile(wb, `Biaya_Obat_per_Kode_${(PROFIL && PROFIL.rs.kode) || "RS"}.xlsx`);
+    XLSX.writeFile(wb, `Biaya_Obat_per_Kode_${(PROFIL && PROFIL.rs.kode) || "RS"}${fBulan ? "_" + fBulan : ""}${fDpjp ? "_" + fDpjp.slice(0, 20) : ""}.xlsx`);
   };
   const Kartu = ({ judul, nilai, ket, merah }) => (
     <div className="bg-[#F4F9FA] border border-[#CFE4E8] rounded-lg p-3">
@@ -10700,7 +10745,7 @@ function PanelBiayaObat() {
     </div>);
   return (
     <div className="space-y-5">
-      <Section title="Biaya Obat & Selisih Klaim INA-CBG" subtitle={`${B.periode || ""} · ${(B.jumlah || 0).toLocaleString("id-ID")} klaim lolos verifikasi (ekspor e-Klaim) · hanya Admin RS`}>
+      <Section title="Biaya Obat & Selisih Klaim INA-CBG" subtitle={filterAktif ? `Filter: ${labelFilter} · ${(RI.n + RJ.n).toLocaleString("id-ID")} klaim · hanya Admin RS` : `${B.periode || ""} · ${(B.jumlah || 0).toLocaleString("id-ID")} klaim lolos verifikasi (ekspor e-Klaim) · hanya Admin RS`}>
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Kartu judul="Selisih rawat inap" nilai={_rpS(RI.tarif - RI.billing)} ket={`tarif ${_rpS(RI.tarif)} − billing ${_rpS(RI.billing)} · ${RI.n.toLocaleString("id-ID")} klaim`} merah={RI.tarif < RI.billing} />
           <Kartu judul="Selisih rawat jalan" nilai={_rpS(RJ.tarif - RJ.billing)} ket={`tarif ${_rpS(RJ.tarif)} − billing ${_rpS(RJ.billing)} · ${RJ.n.toLocaleString("id-ID")} klaim`} merah={RJ.tarif < RJ.billing} />
@@ -10731,7 +10776,7 @@ function PanelBiayaObat() {
         </div>
       </Section>
 
-      <Section title="Per kode INA-CBG" subtitle="Kode dengan minimal 10 klaim · klik judul kolom untuk mengurutkan">
+      <Section title="Per kode INA-CBG" subtitle={filterAktif ? "Sesuai filter · nilai per klaim = rata-rata (median hanya tersedia tanpa filter) · klik judul kolom untuk mengurutkan" : "Kode dengan minimal 10 klaim · klik judul kolom untuk mengurutkan"}>
         <div className="flex flex-wrap items-center gap-2 mb-3">
           <Pilih />
           <div className="relative"><Search size={14} className="absolute left-2 top-2 text-[#94A3AC]" />
@@ -10761,7 +10806,7 @@ function PanelBiayaObat() {
         </div>
       </Section>
 
-      {(B.dpjp || []).length > 0 && (
+      {daftarDpjp.length > 0 && (
         <Section title="Indeks obat per DPJP — rawat inap" subtitle="Bahan diskusi KFT / Komite Medik, bukan penilaian kinerja dokter">
           <div className="overflow-x-auto -mx-6 px-6">
             <table className="w-full text-sm">
@@ -10769,7 +10814,7 @@ function PanelBiayaObat() {
                 <th className="py-2 pr-3">DPJP</th><th className="py-2 pr-3 text-right">Klaim RI</th><th className="py-2 pr-3 text-right">Obat aktual</th><th className="py-2 pr-3 text-right">Obat harapan</th><th className="py-2 pr-3">Indeks</th><th className="py-2 pr-3 text-right">Selisih tarif − billing</th>
               </tr></thead>
               <tbody>
-                {B.dpjp.map(([nama, n, obat, harap, sel]) => { const ix = harap ? obat / harap : 0;
+                {daftarDpjp.map(([nama, n, obat, harap, sel]) => { const ix = harap ? obat / harap : 0;
                   return (
                     <tr key={nama} className="border-b border-[#F0F3F5]">
                       <td className="py-2 pr-3">{nama}</td>
@@ -10782,7 +10827,7 @@ function PanelBiayaObat() {
               </tbody>
             </table>
           </div>
-          <p className="text-[11px] text-[#94A3AC] mt-3">Indeks = biaya obat aktual ÷ biaya obat yang diharapkan bila tiap klaim memakai rerata obat kode INA-CBG yang sama di RS ini (garis tegak = 1,00). Hanya DPJP dengan ≥30 klaim rawat inap. Indeks belum memperhitungkan perbedaan berat kasus di dalam satu kode, lama rawat, maupun spesialisasi — tinggi/rendahnya bukan ukuran benar-salah peresepan.</p>
+          <p className="text-[11px] text-[#94A3AC] mt-3">Indeks = biaya obat aktual ÷ biaya obat yang diharapkan bila tiap klaim memakai rerata obat kode INA-CBG yang sama di RS ini (garis tegak = 1,00). Hanya DPJP dengan ≥{agg ? agg.minDp : 30} klaim rawat inap{filterAktif ? " pada filter ini" : ""}. Indeks belum memperhitungkan perbedaan berat kasus di dalam satu kode, lama rawat, maupun spesialisasi — tinggi/rendahnya bukan ukuran benar-salah peresepan.</p>
         </Section>)}
 
       <p className="text-[11px] text-[#94A3AC]">Sumber: ekspor e-Klaim yang diunggah di Admin RS → Riwayat Grouping (klaim yang dipending BPJS dikeluarkan bila file pending ikut diunggah). Tanpa data pasien. Perbarui dengan mengunggah ulang ekspor terbaru.</p>
@@ -10914,6 +10959,17 @@ export default function App() {
   };
 
   const claims = useMemo(() => screenAllClaims(rawClaims, weights), [rawClaims, weights]);
+  const [fBulan, setFBulan] = useState("");
+  const [fDpjp, setFDpjp] = useState("");
+  const opsiFilter = useMemo(() => {
+    const bl = new Set(), dp = new Map();
+    const tambahDp = (v) => { const k = _kunciDpjp(v); if (k && !dp.has(k)) dp.set(k, String(v).trim()); };
+    claims.forEach((c) => { const b = _bulanKlaim(c); if (b) bl.add(b); tambahDp(c.dpjp); });
+    if (adminRS() && BIAYA_RS && BIAYA_RS.kubus) { BIAYA_RS.kubus.bulan.forEach((b) => bl.add(b)); BIAYA_RS.kubus.dpjp.forEach((d) => d !== "-" && tambahDp(d)); }
+    return { bulan: [...bl].sort().reverse(), dpjp: [...dp.entries()].sort((a, b) => a[1].localeCompare(b[1])) };
+  }, [claims, tab]);
+  const claimsF = useMemo(() => (!fBulan && !fDpjp) ? claims
+    : claims.filter((c) => (!fBulan || _bulanKlaim(c) === fBulan) && (!fDpjp || _kunciDpjp(c.dpjp) === fDpjp)), [claims, fBulan, fDpjp]);
 
   // Jalankan opini AI untuk sebuah klaim dan simpan hasilnya kembali ke data mentah —
   // ini membuat analisis AI menjadi bagian permanen dari data klaim (bukan hasil sementara).
@@ -11088,13 +11144,27 @@ export default function App() {
         {!bolehTulis() && <div className="mb-4 text-xs bg-[#F0F3F5] text-[#334652] rounded-lg px-3 py-2">Anda masuk sebagai <b>{LABEL_PERAN[PROFIL && PROFIL.peran] || "pemantau"}</b> — mode lihat saja. Perubahan tidak disimpan ke server dan opini AI tidak dapat dijalankan.</div>}
         {loaded && TARIF_REF_RAW.length === 0 && <div className="mb-4 text-xs bg-[#FCF1DD] text-[#9A6300] rounded-lg px-3 py-2"><b>Tabel tarif INA-CBG untuk RS ini belum diatur</b> — validasi tarif & kandidat kode belum berjalan. {adminRS() ? "Atur di tab Admin RS → Tabel Tarif." : "Hubungi Admin RS."}</div>}
         {!loaded && !galatMuat && <div className="flex items-center gap-2 text-sm text-[#5B6B76] py-10 justify-center"><Loader2 size={16} className="animate-spin" /> Memuat data klaim dari server...</div>}
-        {tab === "dashboard" && loaded && <Dashboard claims={claims} onSelect={setSelected} onDelete={deleteClaim} onDeleteAll={adminRS() ? deleteAllClaims : null} />}
+        {["dashboard", "dpjp", "kajian", "biaya"].includes(tab) && loaded && (
+          <div className="flex flex-wrap items-center gap-2 mb-4 bg-white border border-[#E2E8ED] rounded-xl px-3 py-2.5">
+            <span className="text-xs font-semibold text-[#334652]">Filter</span>
+            <select aria-label="Filter bulan" value={fBulan} onChange={(e) => setFBulan(e.target.value)} className="rounded-lg border border-[#D7DEE3] px-2 py-1.5 text-sm bg-white">
+              <option value="">Semua bulan</option>
+              {opsiFilter.bulan.map((b) => <option key={b} value={b}>{_bln(b)}</option>)}
+            </select>
+            <select aria-label="Filter DPJP" value={fDpjp} onChange={(e) => setFDpjp(e.target.value)} className="rounded-lg border border-[#D7DEE3] px-2 py-1.5 text-sm bg-white max-w-[260px]">
+              <option value="">Semua DPJP</option>
+              {opsiFilter.dpjp.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+            </select>
+            {(fBulan || fDpjp) && <button onClick={() => { setFBulan(""); setFDpjp(""); }} className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-[#D7DEE3] text-[#334652] bg-white"><X size={12} /> Hapus filter</button>}
+            {tab !== "biaya" && <span className="text-xs text-[#94A3AC] ml-auto">{(fBulan || fDpjp) ? `${claimsF.length.toLocaleString("id-ID")} dari ${claims.length.toLocaleString("id-ID")} klaim` : "Bulan = tanggal keluar (pulang)"}</span>}
+          </div>)}
+        {tab === "dashboard" && loaded && <Dashboard claims={claimsF} onSelect={setSelected} onDelete={deleteClaim} onDeleteAll={adminRS() && !fBulan && !fDpjp ? deleteAllClaims : null} />}
         {tab === "input" && <InputManual onAdd={addClaim} />}
         {tab === "batch" && <BatchUpload onAddMany={addMany} onDone={() => setTab("dashboard")} />}
-        {tab === "dpjp" && <DpjpPattern claims={claims} />}
-        {tab === "kajian" && <KajianInkonsistensi claims={claims} onSelect={setSelected} />}
+        {tab === "dpjp" && <DpjpPattern claims={claimsF} />}
+        {tab === "kajian" && <KajianInkonsistensi claims={claimsF} onSelect={setSelected} />}
         {tab === "settings" && <Settings weights={weights} onChange={setWeight} onReset={resetWeights} autoAI={settings.autoAI} onSetAutoAILevel={setAutoAILevel} />}
-        {tab === "biaya" && adminRS() && <PanelBiayaObat />}
+        {tab === "biaya" && adminRS() && <PanelBiayaObat fBulan={fBulan} fDpjp={fDpjp} />}
         {tab === "adminrs" && adminRS() && <PortalAdminRS />}
         {tab === "sistem" && PROFIL && PROFIL.peran === "superadmin" && <PortalAdminSistem />}
       </main>
