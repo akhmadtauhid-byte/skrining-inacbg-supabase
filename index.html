@@ -5657,6 +5657,8 @@ async function muatRiwayatRS() {
   GROUPER_RS = null;
   FORMULARIUM_RS = null;
   { const f = await supabase.from("riwayat_rs").select("formularium").eq("rs_id", PROFIL.rs.id).maybeSingle(); if (!f.error && f.data && f.data.formularium && f.data.formularium.baris) FORMULARIUM_RS = f.data.formularium; }
+  BIAYA_RS = null;
+  { const b = await supabase.from("riwayat_rs").select("biaya").eq("rs_id", PROFIL.rs.id).maybeSingle(); if (!b.error && b.data && b.data.biaya && b.data.biaya.kode) BIAYA_RS = b.data.biaya; }
   let { data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah, pending, idrg, grouper").eq("rs_id", PROFIL.rs.id).maybeSingle();
   if (!error && data) GROUPER_RS = data.grouper && data.grouper.ri ? data.grouper : null;
   if (error) ({ data, error } = await supabase.from("riwayat_rs").select("diagnosis, presisi, dx_sekunder, periode, jumlah_klaim, diubah, pending, idrg").eq("rs_id", PROFIL.rs.id).maybeSingle());
@@ -5867,6 +5869,7 @@ function normalBarisEklaim(r) {
     sep: String(k("sep", "nosep", "no_sep") ?? "").trim(), bulan: _bulanDari(k("discharge_date", "tglplg", "tgl_pulang")),
     kelas: Number(String(k("kelas_rawat") ?? "3").trim()) || 3,
     umur: (() => { const u = k("umur_tahun", "umur"); return u === undefined || u === "" ? "" : Number(u); })(),
+    biaya: { tarif: Number(String(k("total_tarif") ?? "").replace(/[^\d.]/g, "")) || 0, billing: Number(String(k("tarif_rs") ?? "").replace(/[^\d.]/g, "")) || 0, obat: Number(String(k("obat") ?? "").replace(/[^\d.]/g, "")) || 0 },
     idrg: drg && drg !== "-" ? { drg, desk: String(k("idrg_drg_description") ?? "").trim(), mdc: String(k("idrg_mdc_number") ?? "").trim(), mdcDesk: String(k("idrg_mdc_description") ?? "").trim(),
       tarif: angka(k("idrg_total_tarif")), nbr: angka(k("idrg_nbr")), il: String(k("idrg_diag_lists") ?? "").trim() } : null,
   };
@@ -6091,6 +6094,22 @@ function prediksiIdrgModel(M, dx, px, rirj, umur) {
   const angka = opsi.filter((o) => /^\d$/.test(o));
   const dg = angka.length ? angka.sort((x, y) => Math.abs(Number(x) - S) - Math.abs(Number(y) - S))[0] : (M.sevm[b] || opsi[0]);
   return { kode: b + dg, jml: h[1], denganUmur: !!a };
+}
+
+// ---- v12: PROFIL BIAYA per kode INA-CBG — BIAYA_RS = { periode, kode: { "A-4-14-I": [n, medTarif, medBilling, medObat, p90Obat, porsiRugi] } }
+let BIAYA_RS = null;
+function bangunProfilBiaya(norm) {
+  const per = {};
+  norm.forEach((c) => { if (!c.kode || !c.biaya || !c.biaya.billing) return; (per[c.kode] = per[c.kode] || []).push(c.biaya); });
+  const q = (a, p) => { const b = [...a].sort((x, y) => x - y); if (!b.length) return 0; const i = (b.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i); return Math.round(b[lo] + (b[hi] - b[lo]) * (i - lo)); };
+  const kode = {};
+  Object.entries(per).forEach(([k, r]) => { if (r.length < 10) return;
+    kode[k] = [r.length, q(r.map((x) => x.tarif), 0.5), q(r.map((x) => x.billing), 0.5), q(r.map((x) => x.obat), 0.5), q(r.map((x) => x.obat), 0.9), Math.round(r.filter((x) => x.tarif < x.billing).length / r.length * 1000) / 1000]; });
+  return { jumlah: norm.length, kode };
+}
+function profilBiaya(kode) {
+  const r = BIAYA_RS && BIAYA_RS.kode ? BIAYA_RS.kode[String(kode || "").trim().toUpperCase()] : null;
+  return r ? { n: r[0], tarif: r[1], billing: r[2], obat: r[3], obatP90: r[4], porsiRugi: r[5] } : null;
 }
 
 // ---- pencarian (indeks dibuat sekali per sumber data)
@@ -7792,6 +7811,12 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   validasiKlinisDeterministik(claim).forEach((v) => add(v.id, v.detail));
   // 9l. v10: kesesuaian diagnosis ↔ terapi yang tercatat (dari alasan pending nyata)
   validasiTerapi(claim).forEach((v) => add(v.id, v.detail));
+  // v12: biaya obat klaim jauh di atas kebiasaan kode INA-CBG yang sama (kendali biaya, non-skor)
+  {
+    const pb = profilBiaya(claim.inacbgCode), bo = parseAngka(claim.biayaObat);
+    if (pb && bo > 0 && pb.obat > 0 && bo > pb.obatP90 && bo > 2 * pb.obat) notes.push({ id: "biayaObatTinggi", label: `Biaya obat ${(bo / pb.obat).toLocaleString("id-ID", { maximumFractionDigits: 1 })}× median kode ini`,
+      detail: `Biaya obat klaim ini Rp${bo.toLocaleString("id-ID")}, sedangkan median ${claim.inacbgCode} di RS ini Rp${pb.obat.toLocaleString("id-ID")} (persentil 90: Rp${pb.obatP90.toLocaleString("id-ID")}; ${pb.n.toLocaleString("id-ID")} klaim${BIAYA_RS.periode ? ", " + BIAYA_RS.periode : ""}). Tarif INA-CBG tidak bertambah karena obat — telaah bersama DPJP/farmasi apakah ada obat non-formularium/non-Fornas, durasi antibiotik, atau obat yang semestinya dikode sebagai diagnosis/tindakan (mis. transfusi, kemoterapi). Catatan kendali biaya, tidak memengaruhi skor risiko.` });
+  }
   // v11: obat non-Fornas yang tercatat di resume — catatan kendali biaya (tidak menambah skor)
   {
     const nf = obatNonFornasDiResume(claim.resumeMedis);
@@ -8981,6 +9006,7 @@ function BatchUpload({ onAddMany, onDone }) {
       tanggalDokumen: Array.isArray(r.tanggal_dokumen) ? r.tanggal_dokumen.filter((t) => t && typeof t === "object").slice(0, 40) : [],
       diagnosisDokumen: Array.isArray(r.diagnosis_dokumen) ? r.diagnosis_dokumen.filter((t) => t && typeof t === "object").slice(0, 30) : [],
       tarifRS: String(r.tarif_rs || "").replace(/[.,]\d{1,2}$/, "").replace(/\D/g, ""),
+      biayaObat: String(r.biaya_obat || "").replace(/[.,]\d{1,2}$/, "").replace(/\D/g, ""),
       sep: hasSepData ? sep : null,
       aiStatus: "idle", aiAnalysis: "",
       dariIGD: false, igdKriteriaGawatDarurat: false, igdDirujuk: false, igdLosJam: "",
@@ -9866,6 +9892,8 @@ function LembarKodingEklaim({ claim }) {
             </div>
           );
         })()}
+        {(() => { const pb = profilBiaya(claim.inacbgCode); if (!pb || versi !== "klaim") return null; const f = (v) => "Rp" + Number(v).toLocaleString("id-ID");
+          return <p className="text-[11px] text-[#5B6B76]">Profil biaya {claim.inacbgCode} di RS ini ({pb.n.toLocaleString("id-ID")} klaim): median tarif {f(pb.tarif)} · billing {f(pb.billing)} · obat {f(pb.obat)}{pb.tarif ? ` (${Math.round(pb.obat / pb.tarif * 100)}% tarif)` : ""} · <span className={pb.porsiRugi >= 0.5 ? "text-[#B3261E]" : ""}>{Math.round(pb.porsiRugi * 100)}% klaim billing &gt; tarif</span>{parseAngka(claim.biayaObat) ? ` · obat klaim ini ${f(parseAngka(claim.biayaObat))}` : ""}</p>; })()}
         {claim.inacbgCode && versi === "klaim" && <p className="text-[11px] text-[#5B6B76]">Hasil grouping tercatat: <b className="font-mono">{claim.inacbgCode}</b>{parseAngka(claim.tarifKlaim) ? ` · Rp${parseAngka(claim.tarifKlaim).toLocaleString("id-ID")}` : ""}</p>}
         <div className="flex flex-wrap gap-1.5 pt-1">
           <button type="button" className={tombol} onClick={() => salin(teksLembar(), "lembar")}>{tersalin === "lembar" ? "Tersalin ✓" : "Salin lembar koding"}</button>
@@ -9886,7 +9914,7 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
   const startEdit = () => {
     const s = claim.sep || {};
     setEditForm({
-      inacbgCode: claim.inacbgCode || "", kelasRawat: claim.kelasRawat || "3", umur: claim.umur ?? "",
+      inacbgCode: claim.inacbgCode || "", kelasRawat: claim.kelasRawat || "3", umur: claim.umur ?? "", biayaObat: claim.biayaObat || "",
       severityLevel: claim.severityLevel || "I", tarifKlaim: claim.tarifKlaim || "",
       sepNoSep: s.noSep || "", sepTglSep: s.tglSep || "", sepNoKartu: s.noKartu || "",
       sepDokter: s.dokter || "", sepSubSpesialis: s.subSpesialis || "", sepFaskesPerujuk: s.faskesPerujuk || "",
@@ -9958,6 +9986,8 @@ function DetailModal({ claim, allClaims, onClose, onReanalyze, onMerge, onConfir
                 <input type="number" value={editForm.tarifKlaim} onChange={(e) => setEditForm({ ...editForm, tarifKlaim: e.target.value, _tarifOtomatis: false })} className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" />
                 <InfoTarifOtomatis kode={editForm.inacbgCode} kelas={editForm.kelasRawat} tarif={editForm.tarifKlaim} otomatis={editForm._tarifOtomatis}
                   onIsi={(t) => setEditForm({ ...editForm, tarifKlaim: String(t), _tarifOtomatis: true })} /></label>
+              <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Biaya obat (Rp, rincian tarif RS)</span>
+                <input type="number" min="0" value={editForm.biayaObat} onChange={(e) => setEditForm({ ...editForm, biayaObat: e.target.value })} placeholder="dari Berkas Klaim e-Klaim" className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" /></label>
               <label className="block"><span className="block text-xs text-[#5B6B76] mb-1">Umur pasien (tahun)</span>
                 <input type="number" min="0" value={editForm.umur} onChange={(e) => setEditForm({ ...editForm, umur: e.target.value })} placeholder="untuk perkiraan iDRG" className="w-full rounded-lg border border-[#D7DEE3] px-2.5 py-1.5 text-sm" /></label>
             </div>
@@ -11665,13 +11695,15 @@ function PanelRiwayatGrouping() {
       setProses("Melatih model grouper INA-CBG & iDRG...");
       const grouper = bangunModelInacbg(sepPending.size ? norm.filter((c) => !sepPending.has(c.sep)) : norm);
       if (idrg) idrg.model = bangunModelIdrg(norm);
+      const biaya = bangunProfilBiaya(sepPending.size ? norm.filter((c) => !sepPending.has(c.sep)) : norm); biaya.periode = periode;
       setProses("Menyimpan...");
       const isi = { rs_id: PROFIL.rs.id, diagnosis: h.diagnosis, presisi: h.presisi, dx_sekunder: h.dxSekunder, periode, jumlah_klaim: h.jumlah, sumber: files.map((f) => f.name).join(", ").slice(0, 200), diubah: new Date().toISOString() };
       if (pending) isi.pending = pending;
       if (idrg) isi.idrg = idrg;
       isi.grouper = grouper;
+      if (Object.keys(biaya.kode).length) isi.biaya = biaya;
       let { error } = await supabase.from("riwayat_rs").upsert(isi, { onConflict: "rs_id" });
-      if (error && /grouper/.test(error.message)) { delete isi.grouper; ({ error } = await supabase.from("riwayat_rs").upsert(isi, { onConflict: "rs_id" })); }
+      if (error && /grouper|biaya/.test(error.message)) { delete isi.grouper; delete isi.biaya; ({ error } = await supabase.from("riwayat_rs").upsert(isi, { onConflict: "rs_id" })); }
       if (error) throw new Error(/pending|idrg/.test(error.message) ? "Database belum diperbarui — jalankan SQL 09 dulu. (" + error.message + ")" : error.message);
       await muatRiwayatRS();
       kabar(true, `Diperbarui dari ${h.jumlah.toLocaleString("id-ID")} klaim${sepPending.size ? " lolos verifikasi" : ""}: ${h.diagnosis.length} pola diagnosis, ${h.presisi.length} pola presisi, ${h.dxSekunder.length} pasangan dx sekunder${pending ? `; pola pending dari ${pending.jumlah_pending.toLocaleString("id-ID")} klaim pending (${pending.kunci.length} pola)` : ""}${idrg ? `; iDRG dari ${idrg.jumlah.toLocaleString("id-ID")} klaim (${idrg.pola.length} pola)` : ""}. Langsung dipakai.`);
