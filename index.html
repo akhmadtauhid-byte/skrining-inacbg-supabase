@@ -6939,7 +6939,36 @@ function rekapRekomendasiHtml(claims, opsi) {
     </style></head><body>${ringkasan}${bagianDPJP}${bagianUnit}</body></html>`;
 }
 
+// v16: bilah tombol di halaman cetak (tidak ikut tercetak)
+function denganBilahCetak(html) {
+  if (/id="__bilah"/.test(html)) return html;
+  const gaya = `<style id="__orient"></style><style>
+    #__bilah{position:sticky;top:0;z-index:99;display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:#0F2A3D;color:#fff;padding:8px 14px;font:13px Arial,Helvetica,sans-serif}
+    #__bilah button{font:inherit;border:0;border-radius:6px;padding:7px 13px;cursor:pointer;background:#fff;color:#0F2A3D}
+    #__bilah button.utama{background:#0B7285;color:#fff;font-weight:bold}
+    #__bilah .ket{font-size:11px;color:#A9C1CA;margin-left:4px}
+    .__satu{float:right;font:11px Arial,Helvetica,sans-serif;border:1px solid #0B7285;color:#0B7285;background:#fff;border-radius:5px;padding:3px 9px;cursor:pointer;margin:0 0 4px 8px}
+    @media screen{ body{background:#E9EEF1 !important} #__isi{max-width:210mm;margin:14px auto;background:#fff;padding:10mm;box-shadow:0 1px 5px rgba(0,0,0,.18);box-sizing:border-box} #__isi.mendatar{max-width:297mm} }
+    @media print{ #__bilah,.__satu{display:none !important} #__isi{padding:0;margin:0;max-width:none;box-shadow:none} body.__hanya .hal:not(.__dipilih){display:none !important} }
+  </style>`;
+  const bilah = `<div id="__bilah"><button class="utama" onclick="__cetakSemua()">&#128424; Cetak / Simpan PDF</button>
+    <button id="__btnOr" onclick="__orientasi(!window.__mendatar)">Kertas: A4 tegak</button>
+    <button onclick="window.close()">Tutup</button>
+    <span class="ket">Untuk dikirim lewat WhatsApp/email: pada jendela cetak pilih Tujuan &rarr; &ldquo;Simpan sebagai PDF&rdquo;.</span></div><div id="__isi">`;
+  const skrip = `</div><script>(function(){
+    var o=document.getElementById('__orient');
+    function lepas(){document.body.classList.remove('__hanya');var d=document.querySelectorAll('.__dipilih');for(var i=0;i<d.length;i++)d[i].classList.remove('__dipilih');}
+    window.__cetakSemua=function(){lepas();window.print();};
+    window.__orientasi=function(v){window.__mendatar=!!v;o.textContent=v?'@page{size:A4 landscape}':'';document.getElementById('__isi').classList.toggle('mendatar',!!v);document.getElementById('__btnOr').textContent=v?'Kertas: A4 mendatar':'Kertas: A4 tegak';};
+    var hal=document.querySelectorAll('.hal');
+    for(var i=0;i<hal.length;i++)(function(h){var j=h.querySelector('h2');if(!j||hal.length<2)return;var b=document.createElement('button');b.className='__satu';b.textContent='\u{1F5A8} Cetak lembar ini saja';
+      b.onclick=function(){lepas();h.classList.add('__dipilih');document.body.classList.add('__hanya');window.print();setTimeout(lepas,800);};h.insertBefore(b,h.firstChild);})(hal[i]);
+  })();<\/script>`;
+  return html.replace(/<\/head>/i, gaya + "</head>").replace(/<body([^>]*)>/i, (m) => m + bilah).replace(/<\/body>(?![\s\S]*<\/body>)/i, skrip + "</body>");
+}
+
 function bukaJendelaCetak(html, namaFile) {
+  html = denganBilahCetak(html);
   let win = null;
   try { win = window.open("", "_blank"); } catch (e) { win = null; }
   if (win && !win.closed) {
@@ -9611,7 +9640,7 @@ function printClaims(claims) {
   let html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Cetak Berkas Skrining INA-CBG</title>
     <style>@page { size: A4; margin: 0; } body { margin:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }</style>
     </head><body>${sections}</body></html>`;
-  html = siapKeluar(html, claims);
+  html = denganBilahCetak(siapKeluar(html, claims));
 
   // Jalur utama: coba buka tab baru & langsung print (ideal, tapi sering diblokir
   // panel artifact claude.ai karena berjalan di iframe sandbox).
