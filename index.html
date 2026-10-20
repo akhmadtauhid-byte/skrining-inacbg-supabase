@@ -28,7 +28,7 @@ import {
   AlertTriangle, CheckCircle2, Upload, FileText, X, Loader2,
   Download, Search, Plus, Trash2, ShieldAlert, ShieldQuestion,
   ShieldCheck, Info, Sparkles, Activity, ClipboardList, Users,
-  Sliders, RotateCcw, BookOpen, Save, Printer, Pencil, LogOut, RefreshCw, UserCog, Building2, Lock, Unlock
+  Sliders, RotateCcw, BookOpen, Save, Printer, Pencil, LogOut, RefreshCw, UserCog, Building2, Lock, Unlock, Pill
 } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 
@@ -5869,7 +5869,7 @@ function normalBarisEklaim(r) {
     sep: String(k("sep", "nosep", "no_sep") ?? "").trim(), bulan: _bulanDari(k("discharge_date", "tglplg", "tgl_pulang")),
     kelas: Number(String(k("kelas_rawat") ?? "3").trim()) || 3,
     umur: (() => { const u = k("umur_tahun", "umur"); return u === undefined || u === "" ? "" : Number(u); })(),
-    biaya: { tarif: Number(String(k("total_tarif") ?? "").replace(/[^\d.]/g, "")) || 0, billing: Number(String(k("tarif_rs") ?? "").replace(/[^\d.]/g, "")) || 0, obat: Number(String(k("obat") ?? "").replace(/[^\d.]/g, "")) || 0 },
+    biaya: { tarif: Number(String(k("total_tarif") ?? "").replace(/[^\d.]/g, "")) || 0, billing: Number(String(k("tarif_rs") ?? "").replace(/[^\d.]/g, "")) || 0, obat: Number(String(k("obat") ?? "").replace(/[^\d.]/g, "")) || 0, dpjp: String(k("dpjp") ?? "").trim() },
     idrg: drg && drg !== "-" ? { drg, desk: String(k("idrg_drg_description") ?? "").trim(), mdc: String(k("idrg_mdc_number") ?? "").trim(), mdcDesk: String(k("idrg_mdc_description") ?? "").trim(),
       tarif: angka(k("idrg_total_tarif")), nbr: angka(k("idrg_nbr")), il: String(k("idrg_diag_lists") ?? "").trim() } : null,
   };
@@ -6104,8 +6104,21 @@ function bangunProfilBiaya(norm) {
   const q = (a, p) => { const b = [...a].sort((x, y) => x - y); if (!b.length) return 0; const i = (b.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i); return Math.round(b[lo] + (b[hi] - b[lo]) * (i - lo)); };
   const kode = {};
   Object.entries(per).forEach(([k, r]) => { if (r.length < 10) return;
-    kode[k] = [r.length, q(r.map((x) => x.tarif), 0.5), q(r.map((x) => x.billing), 0.5), q(r.map((x) => x.obat), 0.5), q(r.map((x) => x.obat), 0.9), Math.round(r.filter((x) => x.tarif < x.billing).length / r.length * 1000) / 1000]; });
-  return { jumlah: norm.length, kode };
+    const jml = (f) => Math.round(r.reduce((a, x) => a + x[f], 0));
+    kode[k] = [r.length, q(r.map((x) => x.tarif), 0.5), q(r.map((x) => x.billing), 0.5), q(r.map((x) => x.obat), 0.5), q(r.map((x) => x.obat), 0.9), Math.round(r.filter((x) => x.tarif < x.billing).length / r.length * 1000) / 1000, jml("tarif"), jml("billing"), jml("obat")]; });
+  // ringkasan per bulan × jenis rawat: [bulan, "RI"/"RJ", klaim, tarif, billing, obat]
+  const bl = {};
+  norm.forEach((c) => { if (!c.biaya || !c.biaya.billing || !c.bulan) return; const key = c.bulan + "|" + c.ptd;
+    const b = (bl[key] = bl[key] || [c.bulan, c.ptd, 0, 0, 0, 0]); b[2]++; b[3] += c.biaya.tarif; b[4] += c.biaya.billing; b[5] += c.biaya.obat; });
+  const bulan = Object.values(bl).map((b) => [b[0], b[1], b[2], Math.round(b[3]), Math.round(b[4]), Math.round(b[5])]).sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
+  // indeks obat DPJP (rawat inap): obat aktual / obat harapan (rerata obat kode yang sama), min 30 klaim
+  const rerata = {};
+  Object.entries(per).forEach(([k, r]) => { rerata[k] = r.reduce((a, x) => a + x.obat, 0) / r.length; });
+  const dp = {};
+  norm.forEach((c) => { if (c.ptd !== "RI" || !c.biaya || !c.biaya.billing || !c.biaya.dpjp || !(c.kode in rerata)) return;
+    const d = (dp[c.biaya.dpjp] = dp[c.biaya.dpjp] || [c.biaya.dpjp, 0, 0, 0, 0]); d[1]++; d[2] += c.biaya.obat; d[3] += rerata[c.kode]; d[4] += c.biaya.billing - c.biaya.tarif; });
+  const dpjp = Object.values(dp).filter((d) => d[1] >= 30).map((d) => [d[0], d[1], Math.round(d[2]), Math.round(d[3]), Math.round(d[4])]).sort((a, b) => b[2] / b[3] - a[2] / a[3]);
+  return { jumlah: norm.length, kode, bulan, dpjp };
 }
 function profilBiaya(kode) {
   const r = BIAYA_RS && BIAYA_RS.kode ? BIAYA_RS.kode[String(kode || "").trim().toUpperCase()] : null;
@@ -10630,6 +10643,154 @@ function DpjpPattern({ claims }) {
 }
 
 /* ----------------------------------------------------------------------
+   v13: BIAYA OBAT & SELISIH KLAIM (Admin RS) — dari riwayat_rs.biaya
+---------------------------------------------------------------------- */
+const _rp = (v) => "Rp" + Math.round(v || 0).toLocaleString("id-ID");
+const _rpS = (v) => { const a = Math.abs(v || 0), t = (v < 0 ? "−" : "") + "Rp";
+  return a >= 1e9 ? t + (a / 1e9).toLocaleString("id-ID", { maximumFractionDigits: 2 }) + " M" : a >= 1e6 ? t + (a / 1e6).toLocaleString("id-ID", { maximumFractionDigits: 1 }) + " jt" : t + Math.round(a).toLocaleString("id-ID"); };
+const _pct = (a, b) => (b ? (a / b * 100).toLocaleString("id-ID", { maximumFractionDigits: 1 }) + "%" : "–");
+const _NAMA_BLN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+const _bln = (b) => { const m = String(b).match(/^(\d{4})-(\d{2})$/); return m ? `${_NAMA_BLN[Number(m[2]) - 1]} ${m[1]}` : b; };
+const _jenisKode = (k) => (/^[A-Z]-[146]-/.test(k) ? "RI" : "RJ");
+
+function PanelBiayaObat() {
+  const B = BIAYA_RS;
+  const [jenis, setJenis] = useState("RI");
+  const [cari, setCari] = useState("");
+  const [urut, setUrut] = useState("selisih");
+  const [naik, setNaik] = useState(true);
+  const kodeRows = useMemo(() => {
+    if (!B || !B.kode) return [];
+    return Object.entries(B.kode).filter(([, r]) => r.length >= 9).map(([kode, r]) => {
+      const info = TARIF_REF_RAW.find((t) => t[0] === kode);
+      return { kode, jenis: _jenisKode(kode), desk: info ? info[1] || "" : "", n: r[0], medTarif: r[1], medBilling: r[2], medObat: r[3], p90: r[4], rugi: r[5], tarif: r[6], billing: r[7], obat: r[8], selisih: r[6] - r[7], porsiObat: r[6] ? r[8] / r[6] : 0 };
+    });
+  }, [B]);
+  if (!B || !B.kode || !B.bulan) return (
+    <Section title="Biaya Obat & Selisih Klaim" subtitle="Belum ada data biaya">
+      <p className="text-sm text-[#5B6B76]">Data biaya dibangun dari ekspor e-Klaim (kolom TOTAL_TARIF, TARIF_RS, OBAT). Buka <b>Admin RS → Riwayat Grouping</b>, unggah ekspor e-Klaim, lalu klik <b>Pelajari &amp; simpan</b>.</p>
+    </Section>);
+  const bulan = (B.bulan || []).map((b) => ({ bulan: b[0], jenis: b[1], n: b[2], tarif: b[3], billing: b[4], obat: b[5] }));
+  const tot = (j) => bulan.filter((b) => b.jenis === j).reduce((a, b) => ({ n: a.n + b.n, tarif: a.tarif + b.tarif, billing: a.billing + b.billing, obat: a.obat + b.obat }), { n: 0, tarif: 0, billing: 0, obat: 0 });
+  const RI = tot("RI"), RJ = tot("RJ");
+  const blnJ = bulan.filter((b) => b.jenis === jenis);
+  const maxPorsi = Math.max(0.01, ...blnJ.map((b) => (b.tarif ? b.obat / b.tarif : 0)));
+  const maxSel = Math.max(1, ...blnJ.map((b) => Math.abs(b.tarif - b.billing)));
+  const q = cari.trim().toUpperCase();
+  const kodeJ = kodeRows.filter((r) => r.jenis === jenis && (!q || r.kode.includes(q) || r.desk.toUpperCase().includes(q)))
+    .sort((a, b) => (naik ? 1 : -1) * (a[urut] - b[urut]));
+  const kolom = [["kode", "Kode"], ["n", "Klaim"], ["selisih", "Selisih total"], ["rugi", "% billing > tarif"], ["medTarif", "Median tarif"], ["medBilling", "Median billing"], ["medObat", "Median obat"], ["porsiObat", "Obat / tarif"]];
+  const klikUrut = (k) => { if (k === "kode") return; if (urut === k) setNaik(!naik); else { setUrut(k); setNaik(k === "selisih"); } };
+  const unduh = () => {
+    const rows = kodeRows.map((r) => ({ Kode: r.kode, Jenis: r.jenis, Deskripsi: r.desk, Klaim: r.n, "Total tarif INA-CBG": r.tarif, "Total billing RS": r.billing, "Selisih (tarif − billing)": r.selisih, "Total obat": r.obat, "Median tarif": r.medTarif, "Median billing": r.medBilling, "Median obat": r.medObat, "P90 obat": r.p90, "Porsi klaim billing > tarif": r.rugi }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Per kode INA-CBG");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(bulan.map((b) => ({ Bulan: b.bulan, Jenis: b.jenis, Klaim: b.n, "Tarif INA-CBG": b.tarif, "Billing RS": b.billing, Obat: b.obat, Selisih: b.tarif - b.billing }))), "Per bulan");
+    XLSX.writeFile(wb, `Biaya_Obat_per_Kode_${(PROFIL && PROFIL.rs.kode) || "RS"}.xlsx`);
+  };
+  const Kartu = ({ judul, nilai, ket, merah }) => (
+    <div className="bg-[#F4F9FA] border border-[#CFE4E8] rounded-lg p-3">
+      <p className="text-xs text-[#5B6B76]">{judul}</p>
+      <p className={`text-xl font-semibold ${merah ? "text-[#B3261E]" : "text-[#0F2A3D]"}`}>{nilai}</p>
+      <p className="text-[11px] text-[#94A3AC]">{ket}</p>
+    </div>);
+  const Pilih = () => (
+    <div className="inline-flex rounded-lg border border-[#D7DEE3] overflow-hidden text-xs">
+      {[["RI", "Rawat inap"], ["RJ", "Rawat jalan"]].map(([v, l]) => <button key={v} onClick={() => setJenis(v)} className={`px-3 py-1.5 ${jenis === v ? "bg-[#0B7285] text-white" : "bg-white text-[#334652]"}`}>{l}</button>)}
+    </div>);
+  return (
+    <div className="space-y-5">
+      <Section title="Biaya Obat & Selisih Klaim INA-CBG" subtitle={`${B.periode || ""} · ${(B.jumlah || 0).toLocaleString("id-ID")} klaim lolos verifikasi (ekspor e-Klaim) · hanya Admin RS`}>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <Kartu judul="Selisih rawat inap" nilai={_rpS(RI.tarif - RI.billing)} ket={`tarif ${_rpS(RI.tarif)} − billing ${_rpS(RI.billing)} · ${RI.n.toLocaleString("id-ID")} klaim`} merah={RI.tarif < RI.billing} />
+          <Kartu judul="Selisih rawat jalan" nilai={_rpS(RJ.tarif - RJ.billing)} ket={`tarif ${_rpS(RJ.tarif)} − billing ${_rpS(RJ.billing)} · ${RJ.n.toLocaleString("id-ID")} klaim`} merah={RJ.tarif < RJ.billing} />
+          <Kartu judul="Obat / tarif — rawat inap" nilai={_pct(RI.obat, RI.tarif)} ket={`${_pct(RI.obat, RI.billing)} dari billing · obat ${_rpS(RI.obat)}`} />
+          <Kartu judul="Obat / tarif — rawat jalan" nilai={_pct(RJ.obat, RJ.tarif)} ket={`${_pct(RJ.obat, RJ.billing)} dari billing · obat ${_rpS(RJ.obat)}`} />
+        </div>
+        <p className="text-[11px] text-[#94A3AC] mt-2">Selisih negatif = billing RS di atas tarif INA-CBG. Biaya obat = harga jual RS pada rincian tarif e-Klaim (kolom OBAT, belum termasuk obat kronis/kemoterapi), bukan harga beli.</p>
+      </Section>
+
+      <Section title="Per bulan" subtitle="Porsi obat terhadap tarif INA-CBG dan selisih tarif − billing">
+        <div className="mb-3"><Pilih /></div>
+        <div className="overflow-x-auto -mx-6 px-6">
+          <table className="w-full text-sm">
+            <thead><tr className="text-left text-xs text-[#5B6B76] border-b border-[#E2E8ED]">
+              <th className="py-2 pr-3">Bulan</th><th className="py-2 pr-3 text-right">Klaim</th><th className="py-2 pr-3">Obat / tarif</th><th className="py-2 pr-3">Selisih</th>
+            </tr></thead>
+            <tbody>
+              {blnJ.map((b) => { const p = b.tarif ? b.obat / b.tarif : 0, sel = b.tarif - b.billing;
+                return (
+                  <tr key={b.bulan} className="border-b border-[#F0F3F5]">
+                    <td className="py-2 pr-3 whitespace-nowrap">{_bln(b.bulan)}</td>
+                    <td className="py-2 pr-3 text-right">{b.n.toLocaleString("id-ID")}</td>
+                    <td className="py-2 pr-3 min-w-[160px]"><div className="flex items-center gap-2"><div className="h-2 rounded bg-[#0B7285]" style={{ width: `${Math.max(2, p / maxPorsi * 100)}px` }} /><span className="text-xs">{_pct(b.obat, b.tarif)}</span></div></td>
+                    <td className="py-2 pr-3 min-w-[170px]"><div className="flex items-center gap-2"><div className={`h-2 rounded ${sel < 0 ? "bg-[#B3261E]" : "bg-[#2E7D32]"}`} style={{ width: `${Math.max(2, Math.abs(sel) / maxSel * 100)}px` }} /><span className={`text-xs ${sel < 0 ? "text-[#B3261E]" : "text-[#2E7D32]"}`}>{_rpS(sel)}</span></div></td>
+                  </tr>); })}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="Per kode INA-CBG" subtitle="Kode dengan minimal 10 klaim · klik judul kolom untuk mengurutkan">
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <Pilih />
+          <div className="relative"><Search size={14} className="absolute left-2 top-2 text-[#94A3AC]" />
+            <input value={cari} onChange={(e) => setCari(e.target.value)} placeholder="Cari kode / deskripsi" className="pl-7 pr-2 py-1.5 rounded-lg border border-[#D7DEE3] text-sm w-56" /></div>
+          <button onClick={unduh} className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-[#D7DEE3] bg-white text-[#334652]"><Download size={14} /> Unduh Excel</button>
+          <span className="text-xs text-[#94A3AC]">{kodeJ.length} kode</span>
+        </div>
+        <div className="overflow-x-auto -mx-6 px-6 max-h-[560px] overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-white"><tr className="text-left text-xs text-[#5B6B76] border-b border-[#E2E8ED]">
+              {kolom.map(([k, l]) => <th key={k} onClick={() => klikUrut(k)} className={`py-2 pr-3 whitespace-nowrap ${k !== "kode" ? "text-right cursor-pointer hover:text-[#0B7285]" : ""}`}>{l}{urut === k ? (naik ? " ▲" : " ▼") : ""}</th>)}
+            </tr></thead>
+            <tbody>
+              {kodeJ.map((r) => (
+                <tr key={r.kode} className="border-b border-[#F0F3F5]">
+                  <td className="py-2 pr-3"><span className="font-medium text-[#0F2A3D]">{r.kode}</span>{r.desk && <span className="block text-[11px] text-[#94A3AC] max-w-[260px] truncate" title={r.desk}>{r.desk}</span>}</td>
+                  <td className="py-2 pr-3 text-right">{r.n.toLocaleString("id-ID")}</td>
+                  <td className={`py-2 pr-3 text-right whitespace-nowrap ${r.selisih < 0 ? "text-[#B3261E]" : "text-[#2E7D32]"}`}>{_rpS(r.selisih)}</td>
+                  <td className={`py-2 pr-3 text-right ${r.rugi >= 0.5 ? "text-[#B3261E] font-medium" : ""}`}>{Math.round(r.rugi * 100)}%</td>
+                  <td className="py-2 pr-3 text-right whitespace-nowrap">{_rp(r.medTarif)}</td>
+                  <td className="py-2 pr-3 text-right whitespace-nowrap">{_rp(r.medBilling)}</td>
+                  <td className="py-2 pr-3 text-right whitespace-nowrap">{_rp(r.medObat)}</td>
+                  <td className="py-2 pr-3 text-right">{Math.round(r.porsiObat * 100)}%</td>
+                </tr>))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      {(B.dpjp || []).length > 0 && (
+        <Section title="Indeks obat per DPJP — rawat inap" subtitle="Bahan diskusi KFT / Komite Medik, bukan penilaian kinerja dokter">
+          <div className="overflow-x-auto -mx-6 px-6">
+            <table className="w-full text-sm">
+              <thead><tr className="text-left text-xs text-[#5B6B76] border-b border-[#E2E8ED]">
+                <th className="py-2 pr-3">DPJP</th><th className="py-2 pr-3 text-right">Klaim RI</th><th className="py-2 pr-3 text-right">Obat aktual</th><th className="py-2 pr-3 text-right">Obat harapan</th><th className="py-2 pr-3">Indeks</th><th className="py-2 pr-3 text-right">Selisih tarif − billing</th>
+              </tr></thead>
+              <tbody>
+                {B.dpjp.map(([nama, n, obat, harap, sel]) => { const ix = harap ? obat / harap : 0;
+                  return (
+                    <tr key={nama} className="border-b border-[#F0F3F5]">
+                      <td className="py-2 pr-3">{nama}</td>
+                      <td className="py-2 pr-3 text-right">{n.toLocaleString("id-ID")}</td>
+                      <td className="py-2 pr-3 text-right whitespace-nowrap">{_rpS(obat)}</td>
+                      <td className="py-2 pr-3 text-right whitespace-nowrap">{_rpS(harap)}</td>
+                      <td className="py-2 pr-3 min-w-[150px]"><div className="flex items-center gap-2"><div className="relative h-2 w-[100px] bg-[#F0F3F5] rounded"><div className={`absolute h-2 rounded ${ix > 1.15 ? "bg-[#B3261E]" : ix < 0.9 ? "bg-[#2E7D32]" : "bg-[#0B7285]"}`} style={{ width: `${Math.min(100, ix / 1.6 * 100)}px` }} /><div className="absolute top-[-2px] h-3 w-px bg-[#334652]" style={{ left: `${100 / 1.6}px` }} /></div><span className="text-xs">{ix.toLocaleString("id-ID", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div></td>
+                      <td className={`py-2 pr-3 text-right whitespace-nowrap ${sel > 0 ? "text-[#B3261E]" : "text-[#2E7D32]"}`}>{_rpS(-sel)}</td>
+                    </tr>); })}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[11px] text-[#94A3AC] mt-3">Indeks = biaya obat aktual ÷ biaya obat yang diharapkan bila tiap klaim memakai rerata obat kode INA-CBG yang sama di RS ini (garis tegak = 1,00). Hanya DPJP dengan ≥30 klaim rawat inap. Indeks belum memperhitungkan perbedaan berat kasus di dalam satu kode, lama rawat, maupun spesialisasi — tinggi/rendahnya bukan ukuran benar-salah peresepan.</p>
+        </Section>)}
+
+      <p className="text-[11px] text-[#94A3AC]">Sumber: ekspor e-Klaim yang diunggah di Admin RS → Riwayat Grouping (klaim yang dipending BPJS dikeluarkan bila file pending ikut diunggah). Tanpa data pasien. Perbarui dengan mengunggah ulang ekspor terbaru.</p>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
    PENGATURAN BOBOT
 ---------------------------------------------------------------------- */
 function Settings({ weights, onChange, onReset, autoAI, onSetAutoAILevel }) {
@@ -10873,6 +11034,7 @@ export default function App() {
     { id: "dpjp", label: "Pola DPJP", icon: Users },
     { id: "kajian", label: "Kajian Dokumen", icon: ClipboardList },
     { id: "settings", label: "Pengaturan", icon: Sliders },
+    ...(adminRS() ? [{ id: "biaya", label: "Biaya Obat", icon: Pill }] : []),
     ...(adminRS() ? [{ id: "adminrs", label: "Admin RS", icon: UserCog }] : []),
     ...(PROFIL && PROFIL.peran === "superadmin" ? [{ id: "sistem", label: "Admin Sistem", icon: Building2 }] : []),
   ];
@@ -10932,6 +11094,7 @@ export default function App() {
         {tab === "dpjp" && <DpjpPattern claims={claims} />}
         {tab === "kajian" && <KajianInkonsistensi claims={claims} onSelect={setSelected} />}
         {tab === "settings" && <Settings weights={weights} onChange={setWeight} onReset={resetWeights} autoAI={settings.autoAI} onSetAutoAILevel={setAutoAILevel} />}
+        {tab === "biaya" && adminRS() && <PanelBiayaObat />}
         {tab === "adminrs" && adminRS() && <PortalAdminRS />}
         {tab === "sistem" && PROFIL && PROFIL.peran === "superadmin" && <PortalAdminSistem />}
       </main>
