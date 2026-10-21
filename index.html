@@ -53,6 +53,13 @@ const supabase = KONFIG_BELUM_DIISI ? null : createClient(SUPABASE_URL, SUPABASE
 // { id, nama, email, peran, aktif, rs: { id, kode, nama, kelas, ..., kuota_ai_bulanan, terpakai_bulan_ini } }
 let PROFIL = null;
 const LABEL_PERAN = { superadmin: "Superadmin", admin_rs: "Admin RS", koder: "Koder / Casemix", dpjp: "DPJP", viewer: "Pemantau" };
+// v21: kunci nama DPJP tanpa tanda baca/spasi/kapital — ejaan berbeda dianggap dokter yang sama
+function kunciNamaDpjp(v) { return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); }
+// nama tampilan = ejaan yang paling sering dipakai
+function namaDpjpTampil(list) {
+  const f = {}; list.forEach((c) => { const n = String(c.dpjp || "").trim(); if (n) f[n] = (f[n] || 0) + 1; });
+  return Object.entries(f).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+}
 function bolehTulis() { return !!PROFIL && ["superadmin", "admin_rs", "koder"].includes(PROFIL.peran); }
 function adminRS() { return !!PROFIL && ["superadmin", "admin_rs"].includes(PROFIL.peran); }
 function namaRSAktif() { return (PROFIL && PROFIL.rs && PROFIL.rs.nama) || "Rumah Sakit"; }
@@ -7592,7 +7599,7 @@ function screenAllClaims(claims, weights) {
   // agregasi per DPJP (butuh nama diisi & minimal 5 klaim untuk statistik bermakna)
   const byDpjp = {};
   claims.forEach((c) => {
-    const name = (c.dpjp || "").trim();
+    const name = kunciNamaDpjp(c.dpjp);
     if (!name) return;
     if (!byDpjp[name]) byDpjp[name] = [];
     byDpjp[name].push(c);
@@ -7621,14 +7628,14 @@ function screenAllClaims(claims, weights) {
     const flags = [...base.flags];
     let score = base.score;
 
-    const name = (claim.dpjp || "").trim();
+    const name = kunciNamaDpjp(claim.dpjp);
     if (name && dpjpStats[name] && overallSd > 0) {
       const stat = dpjpStats[name];
       if (stat.avg > overallAvg + 1.5 * overallSd) {
         flags.push({
           id: "dpjpPattern",
           label: RULE_LABELS.dpjpPattern,
-          detail: `DPJP "${name}" memiliki rata-rata skor klaim ${stat.avg.toFixed(1)} dari ${stat.n} klaim (rata-rata RS ${overallAvg.toFixed(1)}), dengan ${(stat.propSevIII * 100).toFixed(0)}% berseverity III. Perlu telaah pola koding pada DPJP ini.`,
+          detail: `DPJP "${(claim.dpjp || "").trim()}" memiliki rata-rata skor klaim ${stat.avg.toFixed(1)} dari ${stat.n} klaim (rata-rata RS ${overallAvg.toFixed(1)}), dengan ${(stat.propSevIII * 100).toFixed(0)}% berseverity III. Perlu telaah pola koding pada DPJP ini.`,
           weight: w.dpjpPattern,
         });
         score += w.dpjpPattern;
@@ -11172,19 +11179,21 @@ function DpjpPattern({ claims }) {
   const stats = useMemo(() => {
     const groups = {};
     claims.forEach((c) => {
-      const name = (c.dpjp || "").trim();
-      if (!name) return;
-      if (!groups[name]) groups[name] = [];
-      groups[name].push(c);
+      const key = kunciNamaDpjp(c.dpjp);
+      if (!key) return;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(c);
     });
     const scores = claims.map((c) => c.score);
     const overallAvg = mean(scores);
     const overallSd = stddev(scores);
-    return Object.entries(groups).map(([name, list]) => {
+    return Object.entries(groups).map(([key, list]) => {
+      const name = namaDpjpTampil(list);
+      const ejaan = [...new Set(list.map((c) => String(c.dpjp || "").trim()).filter(Boolean))];
       const avg = mean(list.map((c) => c.score));
       const propSevIII = list.filter((c) => c.severityLevel === "III").length / list.length;
       const outlier = list.length >= 5 && overallSd > 0 && avg > overallAvg + 1.5 * overallSd;
-      return { name, n: list.length, avg, propSevIII, outlier };
+      return { key, name, ejaan, n: list.length, avg, propSevIII, outlier };
     }).sort((a, b) => b.avg - a.avg);
   }, [claims]);
 
@@ -11207,8 +11216,8 @@ function DpjpPattern({ claims }) {
           </tr></thead>
           <tbody>
             {stats.map((s) => (
-              <tr key={s.name} className="border-b border-[#F0F3F5]">
-                <td className="py-2.5 pr-4">{s.name}</td>
+              <tr key={s.key} className="border-b border-[#F0F3F5]">
+                <td className="py-2.5 pr-4">{s.name}{s.ejaan.length > 1 && <span className="block text-[11px] text-[#94A3AC]" title={s.ejaan.join(" · ")}>digabung dari {s.ejaan.length} ejaan: {s.ejaan.filter((e) => e !== s.name).join("; ")}</span>}</td>
                 <td className="py-2.5 pr-4">{s.n}</td>
                 <td className="py-2.5 pr-4 font-semibold text-[#0F2A3D]">{s.avg.toFixed(1)}</td>
                 <td className="py-2.5 pr-4">{(s.propSevIII * 100).toFixed(0)}%</td>
