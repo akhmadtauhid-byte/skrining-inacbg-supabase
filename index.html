@@ -6742,13 +6742,99 @@ function deteksiCDI(claim, allClaims) {
 }
 
 // Blok saran koding terstruktur yang diletakkan AI di akhir opininya.
+// ---- v20: VALIDASI KODE e-KLAIM (ICD-10 WHO 2010 & ICD-9-CM 2010) ----
+let _KODE_EKLAIM = null, _KODE_EKLAIM_SUMBER = null;
+function _setKodeEklaim() {
+  const sumber = [DAFTAR_RIWAYAT_DIAGNOSIS_INACBG, DAFTAR_RIWAYAT_PRESISI, DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT, GROUPER_RS, GROUPER_ACUAN];
+  if (_KODE_EKLAIM && _KODE_EKLAIM_SUMBER && sumber.every((x, i) => x === _KODE_EKLAIM_SUMBER[i])) return _KODE_EKLAIM;
+  const dx = new Set(), px = new Set();
+  const tDx = (c) => { c = String(c || "").trim().toUpperCase(); if (/^[A-Z]\d{2}(\.\d{1,2})?$/.test(c)) dx.add(c); };
+  const tPx = (c) => String(c || "").split(",").forEach((p) => { p = p.trim(); if (/^\d{2}(\.\d{1,2})?$/.test(p)) px.add(p); });
+  (DAFTAR_RIWAYAT_DIAGNOSIS_INACBG || []).forEach((r) => tDx(r[0]));
+  (DAFTAR_RIWAYAT_PRESISI || []).forEach((r) => tDx(r[0]));
+  (DAFTAR_DIAGNOSIS_SEKUNDER_TERKAIT || []).forEach((r) => { tDx(r[0]); tDx(r[1]); });
+  [GROUPER_RS, GROUPER_ACUAN].forEach((M) => {
+    if (!M) return;
+    Object.keys(M.lv || {}).forEach(tDx);
+    ["ri", "rj"].forEach((j) => Object.keys(M[j] || {}).forEach((k) => {
+      const [t, a, b] = k.split("|");
+      if (t === "p1" || t === "p") tPx(a); else { tDx(a); if (t === "ds" || t === "dp") tPx(b); }
+    }));
+  });
+  _KODE_EKLAIM = { dx, px }; _KODE_EKLAIM_SUMBER = sumber;
+  return _KODE_EKLAIM;
+}
+// status: dikenal (pernah dipakai di e-Klaim RS) | valid (ada di referensi) | ragu (cek di e-Klaim) | tidak (tidak dikenal e-Klaim)
+function cekKodeEklaim(kode, jenis) {
+  let k = String(kode || "").trim().toUpperCase().replace(/\s+/g, "");
+  if (!k) return { status: "kosong", kode: k };
+  if (jenis !== "px" && /^[A-Z]\d{3}$/.test(k)) k = `${k.slice(0, 3)}.${k[3]}`;
+  const S = _setKodeEklaim();
+  if (jenis === "px") {
+    if (!/^\d{2}(\.\d{1,2})?$/.test(k)) {
+      const m = k.match(/^(\d{2})\.?(\d{1,2})/); const sr = m ? `${m[1]}.${m[2]}` : "";
+      return { status: "tidak", kode: k, saran: sr && (S.px.has(sr) || findICD9ProcExact(sr).known) ? sr : "", alasan: "bukan format ICD-9-CM e-Klaim (2 digit + titik + 1–2 digit)" };
+    }
+    if (S.px.has(k)) return { status: "dikenal", kode: k };
+    if (findICD9ProcExact(k).known) return { status: "valid", kode: k };
+    return { status: "ragu", kode: k, alasan: "tidak ada di referensi ICD-9-CM lokal dan belum pernah dipakai di e-Klaim RS ini — cek di e-Klaim" };
+  }
+  const cm = k.match(/^([A-Z]\d{2})\.?(\d)([0-9A-Z]+)$/);
+  if (cm) {
+    const induk = `${cm[1]}.${cm[2]}`;
+    if (S.dx.has(k)) return { status: "dikenal", kode: k };
+    if (/^[MST]/.test(k) && /^\d$/.test(cm[3])) return { status: "ragu", kode: k, saran: induk, alasan: `karakter ke-5 (lokasi/fraktur terbuka-tertutup) — pastikan tersedia di e-Klaim; bila tidak, pakai ${induk}` };
+    return { status: "tidak", kode: k, saran: induk, alasan: "format ICD-10-CM (Amerika) — e-Klaim memakai ICD-10 WHO 2010, maksimal 4 karakter" };
+  }
+  if (!/^[A-Z]\d{2}(\.\d)?$/.test(k) || !findICD10Chapter(k).valid) return { status: "tidak", kode: k, saran: "", alasan: "bukan format/blok ICD-10 WHO" };
+  if (S.dx.has(k)) return { status: "dikenal", kode: k };
+  if (k.length === 3) {
+    const anak = [...S.dx].filter((x) => x.startsWith(k + "."));
+    if (anak.length) return { status: "ragu", kode: k, alasan: `kategori ${k} punya subkategori di e-Klaim (mis. ${anak.slice(0, 3).join(", ")}) — pilih yang sesuai` };
+  }
+  if (findICD10Category3(k).known) return { status: "valid", kode: k };
+  return { status: "ragu", kode: k, alasan: "belum pernah dipakai di e-Klaim RS ini dan kategorinya tidak ada di referensi lokal — cek di e-Klaim" };
+}
+// rapikan kode saran AI: ICD-10-CM → induk WHO; kode tidak dikenal tanpa pengganti ditandai/dibuang dari daftar
+function rapikanKodeAI(item) {
+  const koreksi = [], ragu = [];
+  item.forEach(({ obj, key, jenis, label }) => {
+    if (!obj || !obj[key]) return;
+    const c = cekKodeEklaim(obj[key], jenis);
+    if (c.status === "tidak") {
+      if (c.saran) { koreksi.push(`${label}: ${c.kode} → ${c.saran} (${c.alasan})`); obj[key] = c.saran; obj._dikoreksi = c.kode; }
+      else { ragu.push(`${label}: ${c.kode} — ${c.alasan}; tidak dipakai`); obj._tidakValid = true; }
+    } else if (c.status === "ragu") ragu.push(`${label}: ${c.kode} — ${c.alasan}`);
+  });
+  return { koreksi, ragu };
+}
 function bacaSaranKodingAI(teks) {
   const m = String(teks || "").match(/<<<SARAN_KODING\s*([\s\S]*?)\s*SARAN_KODING>>>/);
   if (!m) return null;
   try {
     const o = parseJsonLonggar(m[1]);
-    return o && typeof o === "object" && !Array.isArray(o) ? o : null;
+    if (!(o && typeof o === "object" && !Array.isArray(o))) return null;
+    const du = o.diagnosisUtama || {};
+    const v = rapikanKodeAI([
+      { obj: du, key: "kodeSaran", jenis: "dx", label: "Diagnosis utama" },
+      ...(o.diagnosisSekunderTambah || []).map((d) => ({ obj: d, key: "kode", jenis: "dx", label: "+ Dx sekunder" })),
+      ...(o.prosedurTambah || []).map((p) => ({ obj: p, key: "kode", jenis: "px", label: "+ Prosedur" })),
+    ]);
+    if (du._tidakValid) du.kodeSaran = "";
+    if (o.diagnosisSekunderTambah) o.diagnosisSekunderTambah = o.diagnosisSekunderTambah.filter((d) => !(d && d._tidakValid));
+    if (o.prosedurTambah) o.prosedurTambah = o.prosedurTambah.filter((p) => !(p && p._tidakValid));
+    Object.defineProperty(o, "_validasiKode", { value: v, enumerable: false });
+    return o;
   } catch (e) { return null; }
+}
+function KotakValidasiKode({ v }) {
+  if (!v || (!v.koreksi.length && !v.ragu.length)) return null;
+  return (
+    <div className="text-xs rounded-lg border border-[#F0E6C8] bg-[#FBF8F0] p-2.5 space-y-1">
+      {v.koreksi.length > 0 && <div><p className="font-semibold text-[#9A6300]">Kode disesuaikan ke standar e-Klaim (ICD-10 WHO 2010 / ICD-9-CM):</p><ul className="list-disc list-inside text-[#5B6B76]">{v.koreksi.map((t, i) => <li key={i}>{t}</li>)}</ul></div>}
+      {v.ragu.length > 0 && <div><p className="font-semibold text-[#9A6300]">Perlu dicek di e-Klaim sebelum dipakai:</p><ul className="list-disc list-inside text-[#5B6B76]">{v.ragu.map((t, i) => <li key={i}>{t}</li>)}</ul></div>}
+      <p className="text-[10px] text-[#94A3AC]">Pastikan deskripsi kode pengganti sesuai kondisi pasien di buku ICD-10 WHO/ICD-9-CM atau pencarian kode e-Klaim.</p>
+    </div>);
 }
 function teksOpiniTanpaBlok(teks) {
   return String(teks || "").replace(/<<<SARAN_KODING[\s\S]*?(SARAN_KODING>>>|$)/, "").trim();
@@ -7998,6 +8084,8 @@ function computeFlags(claim, allClaims, byInacbg, w) {
   const dxToCheck = [["Diagnosis utama", claim.primaryDxCode, claim.primaryDxDesc], ...secDx.map((d, i) => [`Dx sekunder #${i + 1}`, d.code, d.desc])];
   dxToCheck.forEach(([label, code, desc]) => {
     if (!code) return;
+    const vk = cekKodeEklaim(code, "dx");
+    if (vk.status === "tidak" && vk.saran) { notes.push({ id: "icd10FormatInvalid", label: `Kode ${code} tidak dikenal e-Klaim (format ICD-10-CM)`, detail: `${label} "${code}": ${vk.alasan}. Gunakan kode WHO ${vk.saran} (cek deskripsinya sesuai kondisi pasien) — kode ini akan ditolak/tidak terbaca grouper e-Klaim.` }); return; }
     const res = findICD10Chapter(code);
     if (!res.valid) {
       notes.push({ id: "icd10FormatInvalid", label: RULE_LABELS.icd10FormatInvalid, detail: `${label} "${code}" tidak sesuai format ICD-10 atau di luar blok kode resmi (WHO ICD-10 2010). Periksa kembali penulisan kode.` });
@@ -8080,6 +8168,21 @@ async function analyzeClinicalText(clinicalText, jenisKasus, jenisRawat) {
   // #1 (ditandai lewat elemen ke-6 array), baru tambah kandidat kata kunci sbg pelengkap.
   // WAJIB ikut cek ada/tidaknya prosedur yang disarankan AI — tarif operasi vs kontrol
   // biasa bisa beda 3-30x lipat utk diagnosis yang sama (lihat catatan di data riwayat).
+  // v20: kode saran AI disesuaikan ke standar e-Klaim
+  {
+    const holder = { primaryDxCode: result.primaryDxCode };
+    const v = rapikanKodeAI([
+      { obj: holder, key: "primaryDxCode", jenis: "dx", label: "Diagnosis utama" },
+      ...(result.secondaryDx || []).map((d) => ({ obj: d, key: "code", jenis: "dx", label: "Dx sekunder" })),
+      ...(result.procedures || []).map((p) => ({ obj: p, key: "code", jenis: "px", label: "Prosedur" })),
+      ...(result.diagnosisBanding || []).map((d) => ({ obj: d, key: "code", jenis: "dx", label: "Diagnosis banding" })),
+    ]);
+    if (!holder._tidakValid) result.primaryDxCode = holder.primaryDxCode;
+    result.secondaryDx = (result.secondaryDx || []).filter((d) => !d._tidakValid);
+    result.procedures = (result.procedures || []).filter((p) => !p._tidakValid);
+    result.diagnosisBanding = (result.diagnosisBanding || []).filter((d) => !d._tidakValid);
+    result._validasiKode = v;
+  }
   const adaProsedurAI = (result.procedures || []).some((p) => (p.code || "").trim());
   const jenisAI = jenisRawat === "Rawat Jalan" ? "RJ" : "RI";
   const riwayatRS = findRiwayatInacbg(result.primaryDxCode, adaProsedurAI, "3", jenisAI);
@@ -8607,9 +8710,10 @@ function InputManual({ onAdd, claims = [] }) {
                 Tingkat kepastian: {analysisResult.tingkatKepastian}{analysisResult.tingkatKepastian === "Rendah" ? " — cuma dari keluhan & tanda vital, wajib pemeriksaan lanjutan" : ""}
               </div>
             )}
+            <KotakValidasiKode v={analysisResult._validasiKode} />
             <div className="grid sm:grid-cols-2 gap-3 text-sm">
               <div><p className="text-xs text-[#94A3AC]">Diagnosis Utama (kandidat paling mungkin)</p><p className="font-mono font-medium">{analysisResult.primaryDxCode}</p><p className="text-xs text-[#5B6B76]">{analysisResult.primaryDxDesc}</p></div>
-              <div><p className="text-xs text-[#94A3AC]">Severity (saran)</p><p className="font-medium">{analysisResult.severityLevel}</p><p className="text-xs text-[#5B6B76]">{analysisResult.severityAlasan}</p></div>
+              <div><p className="text-xs text-[#94A3AC]">Severity (perkiraan AI — severity resmi ditentukan grouper dari diagnosis sekunder yang terbukti)</p><p className="font-medium">{analysisResult.severityLevel}</p><p className="text-xs text-[#5B6B76]">{analysisResult.severityAlasan}</p></div>
             </div>
             {analysisResult.diagnosisBanding && analysisResult.diagnosisBanding.length > 0 && (
               <div><p className="text-xs text-[#94A3AC] mb-1">Diagnosis Banding (kemungkinan lain)</p>
@@ -9969,6 +10073,7 @@ function PanelSaranKoding({ claim, onUpdateClaim }) {
     <div className="mt-3 border border-[#CFE4E8] rounded-lg overflow-hidden">
       <div className="bg-[#0F2A3D] text-white text-sm font-semibold px-3 py-2">Rekomendasi Koding AI <span className="font-normal text-xs text-[#BFD6DD]">— wajib diverifikasi koder & DPJP</span></div>
       <div className="p-3 space-y-3 text-sm">
+        <KotakValidasiKode v={s._validasiKode} />
         <div>
           <p className="text-xs text-[#94A3AC] mb-0.5">Diagnosis utama</p>
           {gantiUtama ? (
